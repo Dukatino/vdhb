@@ -132,20 +132,20 @@ export function createNotesPanel(ctx) {
       const nf = n.fps || ctx.fps(), fr0 = framesOf(n, ctx.fps());
       const eA = h('input', { class: 'fin', inputmode: 'numeric', value: fr0 ? fr0[0] : '' }), eB = h('input', { class: 'fin', inputmode: 'numeric', value: fr0 ? fr0[1] : '' });
       for (const inp of [eA, eB]) inp.addEventListener('keydown', e => e.stopPropagation());
-      const rangePatch = () => {
+      const rangePatch = async () => {
         const a = ctx.parseFrame(eA.value), b = ctx.parseFrame(eB.value), at = n.at ?? n.t;
         if (a == null && b == null) return fr0 ? { t: at, t2: null, at: null } : {};   // range removed
         if (a == null || b == null) throw new Error('Enter both frames for a range (or leave both blank).');
         const [x, y] = a <= b ? [a, b] : [b, a];
         if (fr0 && fr0[0] === x && fr0[1] === y) return {};
-        return { t: (x + 0.5) / nf, t2: (y + 0.5) / nf, at, ...(n.file === '~live' && ctx.liveCapture ? { images: ctx.liveCapture(x, y) } : {}) };
+        return { t: (x + 0.5) / nf, t2: (y + 0.5) / nf, at, ...(n.file === '~live' && ctx.liveCapture ? { images: await ctx.liveCapture(x, y) } : {}) };
       };
       let kind = n.kind; const chips = KINDS.map(k => h('span', { class: 'chip' + (k === kind ? ' on' : ''), onclick: e => { e.stopPropagation(); kind = k; chips.forEach(c => c.classList.remove('on')); e.target.classList.add('on'); } }, k));
       put(cardEl, h('div', { class: 'hd' }, h('b', { class: 'mono' }, '#' + n.id), h('span', { class: 'mono' }, TC(n.t))), h('div', { class: 'chips' }, chips), ta,
         h('div', { class: 'rrow', onclick: e => e.stopPropagation() }, 'range: frame', eA, '→', eB, h('span', { class: 'dim', style: { fontSize: '11.5px' } }, 'blank = no range')),
         h('div', { class: 'acts', onclick: e => e.stopPropagation() }, h('button', { onclick: () => { editing = null; render(); } }, 'Cancel'),
           h('button', { class: 'primary', onclick: async () => {
-            let rp; try { rp = rangePatch(); } catch (e) { toast(e.message, true); return; }
+            let rp; try { rp = await rangePatch(); } catch (e) { toast(e.message, true); return; }
             const r = await api(`/api/project/${ctx.projectId}/note/${n.id}`, { method: 'POST', body: { text: ta.value.trim(), kind, ...rp } });
             for (const k of Object.keys(n)) if (!(k in r)) delete n[k];
             Object.assign(n, r); editing = null; ctx.changed();

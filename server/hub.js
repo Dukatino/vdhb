@@ -442,8 +442,9 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/live/')) {
       const [, , pid, ...rest] = url.pathname.split('/'), lp = project(pid);
       if (!lp) return send(res, 404, { error: 'not found' });
-      return live.serve(req, res, lp, rest.join('/'));
+      return live.serve(req, res, lp, rest.join('/'), { hubPort: server.address()?.port });
     }
+    if (url.pathname === '/__vh/bridge.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' }); return fs.createReadStream(live.BRIDGE_FILE).on('error', () => res.destroy()).pipe(res); }
     // (browsers don't always send a Referer for module imports, so the cookie set by /live/<id>/... decides too)
     const ref = (req.headers.referer || '').match(/\/live\/([0-9a-f]{12})\//) || (req.headers.cookie || '').match(/(?:^|;\s*)vhlive=([0-9a-f]{12})/);
     if (ref && !fs.existsSync(path.join(UI, decodeURIComponent(url.pathname)))) { const lp = project(ref[1]); if (lp && fs.existsSync(path.join(lp.studio || lp.path, decodeURIComponent(url.pathname)))) return live.serve(req, res, lp, url.pathname.slice(1)); }

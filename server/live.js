@@ -5,6 +5,7 @@ import { norm } from './util.js';
 // players when the code changed so they can reload in place.
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { probe, isInside } from './util.js';
 import { readMeta } from './legacy.js';
 import { vhDir } from './notes.js';
@@ -128,8 +129,21 @@ export async function liveInfo(p) {
     audio: audio ? '/media?p=' + encodeURIComponent(audio) : null, audioPath: audio, audioName: audio ? path.relative(p.path, audio) : null, chunkSec: rc.chunkSec || null };
 }
 
+// The VideoHub window that may talk to a film page: a loopback origin on the hub's own port, from ?vhparent=.
+export function parentOrigin(reqUrl, hubPort) {
+  let o; try { o = new URL(new URL(reqUrl, 'http://127.0.0.1').searchParams.get('vhparent') || ''); } catch { return null; }
+  return o.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(o.hostname) && +o.port === +hubPort ? o.origin : null;
+}
+export const BRIDGE_FILE = fileURLToPath(new URL('../engine-hooks/vhbridge.js', import.meta.url));
+const bridgeTag = origin => `<script src="/__vh/bridge.js" data-hub="${origin}"></script>`;
+export function withBridge(html, origin) {
+  if (!origin) return html;
+  const m = /<head\b[^>]*>/i.exec(html) || /<html\b[^>]*>/i.exec(html);
+  return m ? html.slice(0, m.index + m[0].length) + bridgeTag(origin) + html.slice(m.index + m[0].length) : bridgeTag(origin) + html;
+}
+
 // GET /live/<id>/<file>: the project's own files, never cached (a reload must pick up Claude's edits)
-export function serve(req, res, p, rel) {
+export function serve(req, res, p, rel, { hubPort } = {}) {
   const base = rootOf(p), f = path.resolve(base, decodeURIComponent(rel || 'index.html'));
   if (!isInside(f, base)) { res.writeHead(403); return res.end(); }
   let st; try { st = fs.statSync(f); } catch { res.writeHead(404); return res.end('404'); }
@@ -144,6 +158,7 @@ export function serve(req, res, p, rel) {
     let html = fs.readFileSync(file, 'utf8');
     html = html.replace(/(<script[^>]*type=["']importmap["'][^>]*>)([\s\S]*?)(<\/script>)/gi, (m, a, json, c) => a + json.replace(/"\/(?!\/)/g, '"' + pre) + c)
       .replace(/(\s(?:src|href)=["'])\/(?!\/)/gi, '$1' + pre);
+    html = withBridge(html, parentOrigin(req.url, hubPort));
     res.writeHead(200, head); return res.end(html);
   }
   res.writeHead(200, head);

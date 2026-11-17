@@ -18,8 +18,8 @@ function harness() {
 
 test('a visible player supplies one small cached cover per revision without a background player', async () => {
   const h = harness(); for (let i = 0; i < 120; i++) h.cover.update();
-  assert.equal(h.copies, 1); assert.equal(h.saves.length, 0);
-  await h.flush(); assert.equal(h.saves.length, 1); assert.equal(h.saves[0].revision, 'v1');
+  assert.equal(h.copies, 0); assert.equal(h.pending.size, 1); assert.equal(h.saves.length, 0);
+  await h.flush(); assert.equal(h.copies, 1); assert.equal(h.saves.length, 1); assert.equal(h.saves[0].revision, 'v1');
   h.source.info.revision = 'v2'; h.cover.update(); await h.flush();
   assert.equal(h.copies, 2); assert.equal(h.saves[1].revision, 'v2');
 });

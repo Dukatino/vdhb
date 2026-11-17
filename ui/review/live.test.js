@@ -3,16 +3,19 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-// Run the real source with a controlled frame scheduler and same-origin film iframe.
+// Run the real player and the real film bridge with a controlled frame scheduler. The film page has its own
+// origin and is reached only through postMessage; the fake windows deliver each message at once.
 // No film rendering, browser, audio file or running VideoHub server is required.
 const source = fs.readFileSync(new URL('./live.js', import.meta.url), 'utf8')
   .replace(/^import .+;\r?$/gm, '')
   .replace('export function createLiveSource', 'function createLiveSource');
+const bridge = fs.readFileSync(new URL('../../engine-hooks/vhbridge.js', import.meta.url), 'utf8');
+const HUB = 'http://127.0.0.1:7788', FILM = 'http://127.0.0.1:9001';
 
 function harness({ ready = true } = {}) {
   let now = 0, sequence = 0, renderFailure = null, canvasFailure = false, visibleAt = null;
   const timeouts = new Map(), intervals = new Map(), animationFrames = new Map();
-  const draws = [], statuses = [], iframes = [];
+  const draws = [], statuses = [], iframes = [], hubListeners = [], filmListeners = [];
   const filmCanvas = {
     width: 1920, height: 1080,
     getBoundingClientRect() {
@@ -20,6 +23,14 @@ function harness({ ready = true } = {}) {
       return { left: 0, top: 0, width: 1920, height: 1080 };
     }
   };
+  const canvas = () => {
+    const c = { width: 0, height: 0, sample: null, toDataURL: () => 'data:image/jpeg;base64,test' };
+    c.getContext = () => ({ fillRect() {}, drawImage(img) { c.sample = img === filmCanvas ? visibleAt : img.sample; } });
+    return c;
+  };
+  // the VideoHub window as the film sees it, and the film window as VideoHub sees it (iframe.contentWindow)
+  const hubWindow = { postMessage(data, origin) { if (origin === HUB) for (const fn of [...hubListeners]) fn({ source: filmWindow, origin: FILM, data }); } };
+  const filmWindow = { postMessage(data, origin) { if (origin === FILM) for (const fn of [...filmListeners]) fn({ source: hubWindow, origin: HUB, data }); } };
   const film = {
     READY: false,
     renderOut(at) {
@@ -27,9 +38,13 @@ function harness({ ready = true } = {}) {
       if (renderFailure?.(at)) throw new Error('Film drawing failed');
       visibleAt = at;
     },
-    document: { querySelectorAll: () => [filmCanvas] },
-    addEventListener() {},
+    parent: hubWindow, performance: { now: () => now }, getComputedStyle: () => ({ display: 'block' }),
+    createImageBitmap: async c => ({ sample: c.sample, close() {} }),
+    document: { currentScript: { dataset: { hub: HUB } }, querySelectorAll: () => [filmCanvas], createElement: canvas },
+    addEventListener(type, fn) { if (type === 'message') filmListeners.push(fn); },
   };
+  film.window = film;
+  vm.createContext(film); vm.runInContext(bridge, film);
   const audio = {
     paused: true, ended: false, seeking: false, readyState: 4, currentTime: 0, duration: 120,
     volume: 1, muted: false, playbackRate: 1, playCount: 0,
@@ -39,20 +54,15 @@ function harness({ ready = true } = {}) {
   const h = (tag, attrs = {}) => {
     if (tag === 'audio') return Object.assign(audio, attrs);
     const element = { style: {}, append() {}, replaceWith() {}, remove() { this.removed = true; }, addEventListener() {} };
-    if (tag === 'iframe') { element.contentWindow = film; iframes.push(element); }
+    if (tag === 'iframe') { element.contentWindow = filmWindow; element.src = attrs.src; iframes.push(element); }
     return element;
   };
-  const document = {
-    createElement(tag) {
-      assert.equal(tag, 'canvas');
-      const canvas = { width: 0, height: 0, sample: null, toDataURL: () => 'data:image/jpeg;base64,test' };
-      canvas.getContext = () => ({ fillRect() {}, drawImage() { canvas.sample = visibleAt; } });
-      return canvas;
-    }
-  };
+  const document = { createElement(tag) { assert.equal(tag, 'canvas'); return canvas(); } };
   const sandbox = {
-    h, document, EventTarget, Event, performance: { now: () => now },
-    getComputedStyle: () => ({ display: 'block' }),
+    h, document, EventTarget, Event, URL, performance: { now: () => now },
+    scenesFromPage: (page, dur) => ({ page, dur }),
+    location: { href: HUB + '/review', origin: HUB },
+    window: { addEventListener(type, fn) { if (type === 'message') hubListeners.push(fn); }, removeEventListener(type, fn) { const i = hubListeners.indexOf(fn); if (i >= 0) hubListeners.splice(i, 1); } },
     setInterval: fn => { const id = ++sequence; intervals.set(id, fn); return id; },
     clearInterval: id => intervals.delete(id),
     setTimeout: (fn, delay = 0) => { const id = ++sequence; timeouts.set(id, { fn, at: now + delay }); return id; },
@@ -61,7 +71,7 @@ function harness({ ready = true } = {}) {
     cancelAnimationFrame: id => animationFrames.delete(id),
   };
   vm.createContext(sandbox); vm.runInContext(source, sandbox);
-  const src = sandbox.createLiveSource({ url: '/film/index.html', audio: '/film/mix.wav', w: 1920, h: 1080, dur: 120, fps: 60 }, { onStatus: s => statuses.push(s) });
+  const src = sandbox.createLiveSource({ url: FILM + '/live/abc/index.html', audio: '/film/mix.wav', w: 1920, h: 1080, dur: 120, fps: 60 }, { onStatus: s => statuses.push(s) });
   const makeReady = () => { film.READY = true; for (const fn of [...intervals.values()]) fn(); };
   const advance = (milliseconds, flush = false) => {
     now += milliseconds;
@@ -75,7 +85,7 @@ function harness({ ready = true } = {}) {
   };
   const frame = () => { const callbacks = [...animationFrames.values()]; animationFrames.clear(); for (const fn of callbacks) fn(now); };
   if (ready) makeReady();
-  return { src, film, audio, draws, statuses, makeReady, advance, frame, timeouts, intervals, animationFrames, iframes,
+  return { src, film, audio, draws, statuses, makeReady, advance, frame, timeouts, intervals, animationFrames, iframes, hubListeners, filmWindow, hubWindow,
     get visibleAt() { return visibleAt; },
     failRender: predicate => { renderFailure = predicate; }, failCanvas: value => { canvasFailure = value; },
   };
@@ -147,31 +157,57 @@ test('annotation freeze cancels older seeks and their delayed callbacks', () => 
   h.src.destroy();
 });
 
-test('snap restores the displayed picture and preserves pending playback state even when sampling fails', () => {
+test('snap restores the displayed picture and preserves pending playback state even when sampling fails', async () => {
   const h = harness(); h.src.currentTime = 10; h.frame(); h.src.currentTime = 25;
-  const sampled = h.src.snap(50);
+  const sampled = await h.src.snap(50);
   assert.equal(sampled.sample, 50); assert.equal(h.visibleAt, 10);
   assert.equal(h.src.currentTime, 25); assert.equal(h.src.displayedTime, 10); assert.equal(h.src.seeking, true);
   h.failRender(at => at === 50);
-  assert.equal(h.src.snap(50), null); assert.equal(h.visibleAt, 10); assert.equal(h.src.currentTime, 25);
+  assert.equal(await h.src.snap(50), null); assert.equal(h.visibleAt, 10); assert.equal(h.src.currentTime, 25);
   h.failRender(null); h.failCanvas(true);
-  assert.equal(h.src.snap(50), null); assert.equal(h.visibleAt, 10); assert.equal(h.src.currentTime, 25);
+  assert.equal(await h.src.snap(50), null); assert.equal(h.visibleAt, 10); assert.equal(h.src.currentTime, 25);
   h.failCanvas(false); h.frame(); assert.equal(h.src.displayedTime, 25); assert.equal(h.src.seeking, false);
   h.src.destroy();
 });
 
-test('displayed cover capture copies pixels without rendering, seeking or changing playback', async () => {
+test('displayed cover capture draws only the moment on screen again, without seeking or changing playback', async () => {
   const h = harness(); await h.src.play(); h.advance(10_000); h.frame(); h.advance(5_000);
   const draws = h.draws.length, clock = h.src.currentTime;
-  const picture = h.src.snapDisplayed(480);
+  const picture = await h.src.snapDisplayed(480);
   assert.equal(picture.width, 480); assert.equal(picture.height, 270); assert.equal(picture.sample, 10);
-  assert.equal(h.draws.length, draws); assert.equal(h.src.currentTime, clock);
+  assert.deepEqual(h.draws.slice(draws), [10]); assert.equal(h.src.currentTime, clock);
   assert.equal(h.src.displayedTime, 10); assert.equal(h.src.paused, false);
   h.src.currentTime = 25;
-  assert.equal(h.src.snapDisplayed().sample, 10); assert.equal(h.src.seeking, true);
-  h.failCanvas(true); assert.equal(h.src.snapDisplayed(), null);
-  assert.equal(h.draws.length, draws); assert.equal(h.src.currentTime, 25);
-  h.src.destroy(); assert.equal(h.src.snapDisplayed(), null);
+  assert.equal((await h.src.snapDisplayed()).sample, 10); assert.equal(h.src.seeking, true);
+  h.failCanvas(true); assert.equal(await h.src.snapDisplayed(), null);
+  assert.equal(h.src.currentTime, 25);
+  h.src.destroy(); assert.equal(await h.src.snapDisplayed(), null);
+});
+
+test('the film page gets only bridge requests, and only its own messages are trusted', async () => {
+  const h = harness(); assert.ok(h.iframes[0].src.includes('vhparent=' + encodeURIComponent('http://127.0.0.1:7788')));
+  h.src.currentTime = 10; h.frame(); const draws = h.draws.length;
+  // a reply from another window or origin is ignored, so a stranger cannot complete a seek or fake a frame
+  h.src.currentTime = 30;
+  for (const fn of [...h.hubListeners]) fn({ source: {}, origin: 'http://127.0.0.1:9001', data: { vh: 1, id: 999, ok: true, value: {} } });
+  for (const fn of [...h.hubListeners]) fn({ source: h.filmWindow, origin: 'http://evil.test', data: { vh: 1, ev: 'error', error: 'x' } });
+  assert.equal(h.src.seeking, true); assert.ok(!h.statuses.some(s => s.error === 'x'));
+  h.frame(); assert.equal(h.src.displayedTime, 30); assert.equal(h.draws.length, draws + 1);
+  // the bridge refuses an operation it does not offer
+  const replies = []; h.hubListeners.push(e => replies.push(e.data));
+  h.filmWindow.postMessage({ vh: 1, id: 7, op: 'constructor', args: {} }, 'http://127.0.0.1:9001');
+  h.filmWindow.postMessage({ vh: 1, id: 8, op: 'qaShot', args: {} }, 'http://127.0.0.1:9001');
+  assert.deepEqual(replies.map(r => r.id), [8]);
+  h.src.destroy();
+});
+
+test('scenes come from plain page data, with __qaShotAt answered from names sampled by the page', async () => {
+  const h = harness(); h.film.__qaShotAt = t => (t < 1 ? 'a' : 'b');
+  const r = await h.src.scenes(2);
+  assert.equal(r.dur, 2); assert.equal(r.page.__qaShotAt(0.5), 'a'); assert.equal(r.page.__qaShotAt(1.5), 'b');
+  h.film.SHOTS = [{ id: 's', t0: 0, t1: 2, fn() {} }];
+  const s = await h.src.scenes(2); assert.equal(s.page.__qaShotAt, undefined); assert.equal(JSON.stringify(s.page.SHOTS), '[{"id":"s","t0":0,"t1":2}]');
+  h.src.destroy();
 });
 
 test('failed draws do not advertise a new displayed frame', () => {
@@ -211,5 +247,5 @@ test('reload respects pausing during load and destroy cancels delayed play, seek
   h.src.destroy(); h.advance(10_000, true); for (const fn of queuedFrames) fn();
   assert.equal(h.timeouts.size, 0); assert.equal(h.intervals.size, 0); assert.equal(h.animationFrames.size, 0);
   assert.equal(h.draws.length, draws); assert.equal(h.audio.playCount, 1); assert.equal(h.src.paused, true);
-  assert.equal(h.src.snap(20), null); assert.equal(h.iframes.at(-1).removed, true);
+  assert.equal(await h.src.snap(20), null); assert.equal(h.iframes.at(-1).removed, true); assert.equal(h.hubListeners.length, 0);
 });

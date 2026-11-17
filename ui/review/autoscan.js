@@ -34,14 +34,14 @@ export function createAutoScan({ src, projectId, frame, panelHost, onOpen, onClo
 
   // one frame: the engine's own QA numbers, or a 160x90 luma picture of the page
   const thumb = h('canvas', { width: 160, height: 90 }), tg = thumb.getContext('2d', { willReadFrequently: true });
-  function sample(t) {
+  async function sample(t) {
     const w = win();
     if (typeof w.qaFrame === 'function') {
       const r = w.qaFrame(t), [p, q] = r.lum.split('|'), s = atob(p) + atob(q), buf = new Uint8Array(N);
       for (let i = 0; i < N; i++) buf[i] = s.charCodeAt(i);
       delete r.lum; r.lumBuf = buf; return r;
     }
-    const cv = src.snap(t, 320); if (!cv) return null;
+    const cv = await src.snap(t, 320); if (!cv) return null;
     tg.drawImage(cv, 0, 0, 160, 90);
     const px = tg.getImageData(0, 0, 160, 90).data, buf = new Uint8Array(N); let sum = 0;
     for (let i = 0; i < N; i++) { buf[i] = Math.round(px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114); sum += buf[i]; }
@@ -68,7 +68,7 @@ export function createAutoScan({ src, projectId, frame, panelHost, onOpen, onClo
       // warm the state that carries from frame to frame (faces, marks), like a chunk render does
       const w = win(); for (let f = Math.max(0, frames[0] - Math.round(2 * F)); f < frames[0]; f += 2) w.renderOut(f / F);
       for (let i = 0; i < frames.length && !stop; i++) {
-        const r = sample(frames[i] / F); if (r) { r.f = frames[i]; res.push(r); }
+        const r = await sample(frames[i] / F); if (r) { r.f = frames[i]; res.push(r); }
         prog.done = i + 1;
         if (i % 4 === 3) { paintProgress(); await sleep(0); }
       }
@@ -127,7 +127,7 @@ export function createAutoScan({ src, projectId, frame, panelHost, onOpen, onClo
   }
 
   async function toNote(r, i) {
-    const t = (r.t0 + r.t1) / 2, img = src.capture ? src.capture(t, 1280) : null;
+    const t = (r.t0 + r.t1) / 2, img = src.capture ? await src.capture(t, 1280) : null;
     try {
       await api(`/api/project/${projectId}/notes`, { method: 'POST', body: { t: r.t0, t2: r.t1 > r.t0 ? r.t1 : null, at: t, file: '~live', fps: fps(), kind: 'visual', text: `Auto scan: ${KIND[r.kind][0]}${r.shot ? ' (' + r.shot + ')' : ''} — ${r.infos.join(' | ')}`, images: img ? { frame: img } : undefined } });
       added.add(i); paint(); toast('Note added'); reloadNotes?.();

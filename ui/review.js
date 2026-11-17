@@ -9,7 +9,6 @@ import { createLiveSource } from './review/live.js';
 import { createLiveCover } from './review/cover.js';
 import { createSceneEditor } from './review/sceneedit.js';
 import { createMixer } from './review/mixer.js';
-import { scenesFromPage } from './review/scenes.js';
 import { createSoundEditor } from './review/soundedit.js';
 import { createEdit2d } from './review/edit2d.js';
 import { createAutoScan } from './review/autoscan.js';
@@ -283,7 +282,7 @@ export async function reviewPage(page, id, relArg = '') {
     parkedDrafts: () => S.parkedDrafts, restoreDraft: entry => restoreDraft(entry),
     gotoDraft: () => S.draft && seekFrame(S.draft.frame), cancelDraft: () => cancelDraft(), saveDraft: () => saveDraft(),
     startTour: () => startTour(),
-    liveCapture: liveSrc ? (a, b) => ({ start: liveSrc.capture((a + 0.5) / fps()), end: liveSrc.capture((b + 0.5) / fps()) }) : null,
+    liveCapture: liveSrc ? async (a, b) => ({ start: await liveSrc.capture((a + 0.5) / fps()), end: await liveSrc.capture((b + 0.5) / fps()) }) : null,
     range: () => S.range, rangeOk: () => rangeOk(), setRange: (a, b) => setRange(a, b), frame: () => S.frame, parseFrame: v => parseFrame(v), playRange: n => playRange(n),
     changed: () => { notesPanel.render(); timeline.draw(); redraw(); }, removeNote: nid => { notes = notes.filter(n => n.id !== nid); notesPanel.render(); timeline.draw(); redraw(); },
     reloadNotes: async () => { notes = await api(`/api/project/${id}/notes`); notesPanel.render(); timeline.draw(); redraw(); notesPanel.refreshOld(); },
@@ -544,7 +543,7 @@ export async function reviewPage(page, id, relArg = '') {
     if (d.resume) videoA.play().catch(() => { });   // the click paused a playing video: carry on watching
     perf.shown(!!d.resume);
     try {
-      if (shots) for (const [k, c] of Object.entries(shots)) if (c) body.images[k] = await encodeJpeg(c);
+      if (shots) for (const [k, p] of Object.entries(shots)) { const c = await p; if (c) body.images[k] = await encodeJpeg(c); }
       const tp = performance.now(); const n = await api(`/api/project/${id}/notes`, { method: 'POST', body }); perf.post(performance.now() - tp);
       const early = earlyNotes.get(n.id); earlyNotes.delete(n.id);
       const sel = S.selected === tmp.id; for (const k of Object.keys(tmp)) delete tmp[k]; Object.assign(tmp, early?.imgV ? early : n);
@@ -798,9 +797,9 @@ export async function reviewPage(page, id, relArg = '') {
   // scenes for the timeline's scene lane: from the live page when it is ready (stored for the rendered videos too),
   // else what the hub stored / the project's shots.json
   let scenesKey = '';
-  function loadScenes(fromPage) {
+  async function loadScenes(fromPage) {
     if (fromPage && liveSrc) {
-      let r = { scenes: [] }; try { r = scenesFromPage(liveSrc.win, dur()); } catch { }
+      let r = { scenes: [] }; try { r = await liveSrc.scenes(dur()); } catch { }
       if (r.scenes.length) {
         const k = JSON.stringify(r.scenes); if (k === scenesKey) return; scenesKey = k;
         timeline.setScenes(r.scenes);
@@ -953,7 +952,7 @@ export async function reviewPage(page, id, relArg = '') {
 
   // ---------- misc actions
   async function saveFrame() {
-    if (liveSrc) { const url = liveSrc.capture((S.frame + 0.5) / fps(), cur.w || 1920); if (!url) return toast('Could not capture frame', true); const a = h('a', { href: url, download: `${(p.title || p.name).replace(/[\\/:*?"<>|]/g, '')}_canli_kare${S.frame}.jpg` }); document.body.append(a); a.click(); a.remove(); return; }
+    if (liveSrc) { const url = await liveSrc.capture((S.frame + 0.5) / fps(), cur.w || 1920); if (!url) return toast('Could not capture frame', true); const a = h('a', { href: url, download: `${(p.title || p.name).replace(/[\\/:*?"<>|]/g, '')}_canli_kare${S.frame}.jpg` }); document.body.append(a); a.click(); a.remove(); return; }
     const r = await fetch(`/api/media/frame?p=${encodeURIComponent(cur.path)}&n=${S.frame}`); if (!r.ok) { toast('Could not capture frame', true); return; }
     const url = URL.createObjectURL(await r.blob()); const a = h('a', { href: url, download: `${cur.name.replace(/\.[^.]+$/, '')}_kare${S.frame}.png` }); document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
@@ -961,7 +960,7 @@ export async function reviewPage(page, id, relArg = '') {
   async function frameToThumbnail() {
     try {
       let data;
-      if (liveSrc) data = liveSrc.capture((S.frame + 0.5) / fps(), 1920);
+      if (liveSrc) data = await liveSrc.capture((S.frame + 0.5) / fps(), 1920);
       else {
         const r = await fetch(`/api/media/frame?p=${encodeURIComponent(cur.path)}&n=${S.frame}`); if (!r.ok) throw new Error('could not capture frame');
         const blob = await r.blob();

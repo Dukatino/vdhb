@@ -2,19 +2,59 @@
 // /live/<id>/...) draws any moment with window.renderOut(t) on fixed-size canvases. This object looks enough
 // like an HTMLVideoElement (currentTime, play/pause, events, requestVideoFrameCallback) for the review player.
 // While playing, the project's audio is the clock; frames that take too long are skipped, never slowed down.
+// The film page is reached only through engine-hooks/vhbridge.js messages: a film may come from anywhere, and
+// this window can run commands through the hub.
 import { h } from '../app.js';
+import { scenesFromPage } from './scenes.js';
+
+// keys a film page may pass on to the player (Space = play); never editing keys such as Delete or Ctrl+Z
+const FILM_KEYS = new Set([' ', 'ArrowLeft', 'ArrowRight', ',', '.', 'Home', 'End', 'j', 'k', 'l', 'Escape']);
 
 export function createLiveSource(info, { onStatus } = {}) {
   const box = h('div', { class: 'livebox' });
-  let waitTimer = 0, iframe = null, win = null, ready = false, t = 0, paused = true, rate = 1, seeking = false;
+  const filmOrigin = new URL(info.url, location.href).origin;
+  let waitTimer = 0, iframe = null, ready = false, t = 0, paused = true, rate = 1, seeking = false;
   let displayedTime = 0, destroyed = false, loadVersion = 0, seekVersion = 0, seekTimer = 0, playTimer = 0;
   let wantPlay = false;   // play asked for while the page was loading: start once it is ready
   let base = { t: 0, at: 0 }, raf = 0, need = false, rvfc = [], frames = 0, fpsAt = performance.now(), drawMs = 0, scale = 1;
+  let drawing = false, drawingAt = null, drawAgain = false;   // one renderOut in flight: slow frames are skipped
   const audio = info.audio ? h('audio', { src: info.audio, preload: 'auto' }) : null;
   const src = new EventTarget();
   const fire = type => src.dispatchEvent(new Event(type));
   const status = s => onStatus && onStatus(s);
   const clampTime = value => Math.max(0, Math.min(info.dur, +value || 0));
+
+  // A request to the film page; done(error, value) runs when the page answers, or after `ms` without an answer.
+  let seq = 0; const calls = new Map();
+  function send(op, args, done, ms = 15000) {
+    const w = iframe && iframe.contentWindow;
+    if (!w || destroyed) { done(new Error('The film page is not loaded.')); return; }
+    const id = ++seq;
+    calls.set(id, { done, timer: setTimeout(() => { const c = calls.get(id); if (c) { calls.delete(id); c.done(new Error('The film page did not answer.')); } }, ms) });
+    try { w.postMessage({ vh: 1, id, op, args }, filmOrigin); }
+    catch (e) { const c = calls.get(id); if (c) { calls.delete(id); clearTimeout(c.timer); c.done(e); } }
+  }
+  const ask = (op, args, ms) => new Promise((resolve, reject) => send(op, args, (e, v) => (e ? reject(e) : resolve(v)), ms));
+  function dropCalls() {
+    const all = [...calls.values()]; calls.clear();
+    for (const c of all) { clearTimeout(c.timer); try { c.done(new Error('The film page was reloaded.')); } catch { } }
+  }
+  function forwardKey(m) {
+    if (!FILM_KEYS.has(m.key) || m.ctrlKey || m.metaKey || m.altKey || (m.type !== 'keydown' && m.type !== 'keyup')) return;
+    document.dispatchEvent(new KeyboardEvent(m.type, { key: m.key, code: String(m.code || ''), shiftKey: !!m.shiftKey, repeat: !!m.repeat, bubbles: true, cancelable: true }));
+  }
+  function onMessage(e) {
+    if (!iframe || e.source !== iframe.contentWindow || e.origin !== filmOrigin) return;
+    const m = e.data; if (!m || m.vh !== 1) return;
+    if (m.id != null) {
+      const c = calls.get(m.id); if (!c) return;
+      calls.delete(m.id); clearTimeout(c.timer);
+      c.done(m.ok ? null : new Error(String(m.error || 'The film page failed.')), m.value); return;
+    }
+    if (m.ev === 'error' && !ready) { clearInterval(waitTimer); status({ state: 'error', error: String(m.error || 'Script error') }); }
+    else if (m.ev === 'key') forwardKey(m);
+  }
+  window.addEventListener('message', onMessage);
 
   function clearSeek() {
     ++seekVersion; clearTimeout(seekTimer); seekTimer = 0;
@@ -24,69 +64,65 @@ export function createLiveSource(info, { onStatus } = {}) {
   function load() {
     if (destroyed) return;
     const version = ++loadVersion;
+    dropCalls(); drawing = false; drawingAt = null; drawAgain = false;
     clearTimeout(playTimer); playTimer = 0; rvfc = [];
     ready = false; status({ state: 'loading' });
-    const f = h('iframe', { class: 'live', src: `${info.url}${info.url.includes('?') ? '&' : '?'}vh=${Date.now()}`, scrolling: 'no', tabindex: '-1' });
+    const q = `vhparent=${encodeURIComponent(location.origin)}&vh=${Date.now()}`;
+    const f = h('iframe', { class: 'live', src: `${info.url}${info.url.includes('?') ? '&' : '?'}${q}`, scrolling: 'no', tabindex: '-1' });
     f.style.width = info.w + 'px'; f.style.height = info.h + 'px'; f.style.transform = `scale(${scale})`;
     if (iframe) iframe.replaceWith(f); else box.append(f);
     iframe = f;
     const t0 = performance.now();
+    let asking = false;
     clearInterval(waitTimer);
+    // a message sent before the page and its bridge have loaded is lost: ask again after a short wait
     const wait = waitTimer = setInterval(() => {
-      if (destroyed || version !== loadVersion) return;
-      try { win = iframe.contentWindow; } catch { win = null; }
-      const err = win && win.__vhError;
-      if (err) { clearInterval(wait); status({ state: 'error', error: err }); return; }
-      if (win && win.READY === true && typeof win.renderOut === 'function') {
+      if (destroyed || version !== loadVersion || asking) return;
+      if (performance.now() - t0 > 120000) { clearInterval(wait); status({ state: 'error', error: 'The page was not ready within 2 minutes (no READY signal).' }); return; }
+      asking = true;
+      send('state', null, (err, s) => {
+        asking = false;
+        if (err || !s || destroyed || version !== loadVersion || waitTimer !== wait) return;
+        if (s.error) { clearInterval(wait); status({ state: 'error', error: s.error }); return; }
+        if (!s.ready) return;
         clearInterval(wait); ready = true; status({ state: 'ready', ms: Math.round(performance.now() - t0) });
         if (wantPlay) playTimer = setTimeout(() => { playTimer = 0; if (!destroyed && version === loadVersion && wantPlay) play(); }, 50);
-        // the page may know its own timing and size better (the 3D studio sets window.__config)
-        let c = win.__config || win.VH_CONFIG;
-        // no config: the page's DATA size, else its biggest canvas when its shape differs (a 9:16 film shown as 16:9
-        // showed only its top square, Oct 28)
-        if (!c && +win.DATA?.width && +win.DATA?.height) c = { width: +win.DATA.width, height: +win.DATA.height };
-        if (!c) {
-          const cv = [...win.document.querySelectorAll('canvas')].sort((a, b) => b.width * b.height - a.width * a.height)[0];
-          if (cv && cv.width >= 64 && cv.height >= 64 && Math.abs(cv.width / cv.height - info.w / info.h) > 0.01) c = { width: cv.width, height: cv.height };
-        }
+        // the page may know its own timing and size better (the 3D studio sets window.__config); else its DATA
+        // size, else its biggest canvas when its shape differs (a 9:16 film must not show only its top square)
+        let c = s.config || s.data;
+        if (!c && s.canvas && s.canvas.width >= 64 && s.canvas.height >= 64 && Math.abs(s.canvas.width / s.canvas.height - info.w / info.h) > 0.01) c = s.canvas;
         if (c) {
           if (+c.fps) info.fps = +c.fps; if (+c.duration) info.dur = +c.duration;
           const w = +(c.outWidth || c.width), hh = +(c.outHeight || c.height); if (w && hh) { info.w = w; info.h = hh; iframe.style.width = w + 'px'; iframe.style.height = hh + 'px'; }
         }
         present(); fire('loadedmetadata'); fire('timeupdate');
-      } else if (performance.now() - t0 > 120000) { clearInterval(wait); status({ state: 'error', error: 'The page was not ready within 2 minutes (no READY signal).' }); }
+      }, 400);
     }, 100);
-    f.addEventListener('load', () => { try { f.contentWindow.addEventListener('error', e => { f.contentWindow.__vhError = e.message; }); } catch { } });
-    // keys pressed while the focus is inside the film page (a click that landed on it) still drive VideoHub (Space = play)
-    f.addEventListener('load', () => { try {
-      const fw = (e) => {
-        if (e.target?.closest?.('input, textarea, select, [contenteditable]')) return;
-        e.preventDefault(); e.stopPropagation();
-        document.dispatchEvent(new KeyboardEvent(e.type, { key: e.key, code: e.code, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey, metaKey: e.metaKey, repeat: e.repeat, bubbles: true, cancelable: true }));
-      };
-      f.contentWindow.addEventListener('keydown', fw, true); f.contentWindow.addEventListener('keyup', fw, true);
-    } catch { } });
   }
 
+  // A seek completes only when the frame asked for after it is on screen.
   function draw() {
     if (!ready || destroyed) return;
-    const a = performance.now();
     const at = t;
-    try { win.renderOut(at); displayedTime = at; } catch (e) { status({ state: 'error', error: e.message }); return; }
-    drawMs = drawMs * 0.8 + (performance.now() - a) * 0.2;
-    frames++;
-    const cbs = rvfc; rvfc = []; for (const cb of cbs) try { cb(performance.now(), { mediaTime: at }); } catch { }
+    if (drawing) { if (at !== drawingAt) drawAgain = true; return; }
+    drawing = true; drawingAt = at;
+    const version = loadVersion, seekV = seeking ? seekVersion : 0, a = performance.now();
+    send('render', { t: at }, err => {
+      if (version !== loadVersion || destroyed) return;
+      drawing = false; drawingAt = null;
+      if (err) { drawAgain = false; status({ state: 'error', error: err.message }); return; }
+      displayedTime = at;
+      drawMs = drawMs * 0.8 + (performance.now() - a) * 0.2;
+      frames++;
+      const cbs = rvfc; rvfc = []; for (const cb of cbs) try { cb(performance.now(), { mediaTime: at }); } catch { }
+      if (seekV && seekV === seekVersion && seeking) {
+        seeking = false; need = false; clearTimeout(seekTimer); seekTimer = 0;
+        fire('seeked'); fire('timeupdate');
+      }
+      if (drawAgain) { drawAgain = false; draw(); }
+    }, 30000);
   }
-
-  function present() {
-    const pending = seeking, version = seekVersion;
-    draw();
-    // A frame callback can request another seek; only complete the one just presented.
-    if (pending && version === seekVersion && ready) {
-      seeking = false; need = false; clearTimeout(seekTimer); seekTimer = 0;
-      fire('seeked'); fire('timeupdate');
-    }
-  }
+  const present = () => draw();
   // the film's clock: its own, unless the sound is really playing (loaded, not seeking); a sound still loading or stalled
   // used to hold the picture at its time (0) — now the picture goes on and the sound is brought to it once it can play
   // the film's clock is the picture's own: the sound never sets it (a big WAV in Edge "played" at 0 for seconds, then
@@ -139,33 +175,28 @@ export function createLiveSource(info, { onStatus } = {}) {
     fire('timeupdate');
   }
 
-  // Copy the picture already on screen, without running the film or changing its time.
-  function copyPicture(width) {
-    const c = document.createElement('canvas'); c.width = width; c.height = Math.round(width * info.h / info.w);
-    const g = c.getContext('2d'); g.fillStyle = '#000'; g.fillRect(0, 0, c.width, c.height);
-    const k = c.width / info.w;
-    for (const cv of win.document.querySelectorAll('canvas')) {
-      const r = cv.getBoundingClientRect(); if (!r.width || !r.height || getComputedStyle(cv).display === 'none') continue;
-      try { g.drawImage(cv, r.left * k, r.top * k, r.width * k, r.height * k); } catch { }
-    }
-    return c;
-  }
-  function snapDisplayed(width = 480) {
+  // The page draws `at`, copies its canvases into one picture of `width` px and draws `keep` again, in one task.
+  // at = null: the moment on screen, drawn again so a WebGL picture is still there to copy; playback is untouched.
+  async function snap(at, width = 1280) {
     if (!ready || destroyed) return null;
-    try { return copyPicture(width); } catch { return null; }
-  }
-  // every frame of the page's canvases, stacked in page order, as one picture: snap() draws it into a canvas now
-  // (the page must show that moment), encode() turns it into a JPEG data URL off the main thread
-  function snap(at, width = 1280) {
-    if (!ready || destroyed) return null;
-    const keep = displayedTime;
+    const keep = displayedTime, moment = at == null ? keep : clampTime(at);
     try {
-      win.renderOut(clampTime(at));
-      return copyPicture(width);
-    } catch (e) { status({ state: 'error', error: e.message }); return null; }
-    finally { try { win.renderOut(keep); } catch (e) { status({ state: 'error', error: e.message }); } }
+      const bmp = await ask('snap', { t: moment, keep, width, w: info.w, h: info.h });
+      if (!bmp || destroyed) return null;
+      const c = document.createElement('canvas'); c.width = width; c.height = Math.round(width * info.h / info.w);
+      c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height); bmp.close?.();
+      return c;
+    } catch (e) { if (at != null && !destroyed) status({ state: 'error', error: e.message }); return null; }
   }
-  const capture = (at, width) => snap(at, width)?.toDataURL('image/jpeg', 0.9) || null;
+  const snapDisplayed = (width = 480) => snap(null, width);
+  const capture = async (at, width) => (await snap(at, width))?.toDataURL('image/jpeg', 0.9) || null;
+  // the film's scenes for the timeline (see scenes.js); the page sends plain data, never its functions
+  async function scenes(dur) {
+    if (!ready || destroyed) return { scenes: [], source: null };
+    const raw = await ask('scenes', { dur });
+    const names = Array.isArray(raw?.qa) ? raw.qa : null;
+    return scenesFromPage({ VH_SCENES: raw?.VH_SCENES, SHOTS: raw?.SHOTS, EVENTS: raw?.EVENTS, PIECES: raw?.PIECES, ...(names ? { __qaShotAt: at => names[Math.round(at / 0.05)] ?? '' } : {}) }, dur);
+  }
 
   Object.defineProperties(src, {
     displayedTime: { get: () => displayedTime },
@@ -184,7 +215,7 @@ export function createLiveSource(info, { onStatus } = {}) {
       fire('seeking');
     } },
     paused: { get: () => paused && !wantPlay },
-    win: { get: () => win },   // the page itself (scene editor: window.VH_EDIT)
+    win: { get: () => iframe?.contentWindow || null },   // the page itself (scene editor: window.VH_EDIT)
     seeking: { get: () => seeking },
     ended: { get: () => t >= info.dur - 1e-3 },
     duration: { get: () => info.dur },
@@ -194,7 +225,7 @@ export function createLiveSource(info, { onStatus } = {}) {
     muted: { get: () => audio ? audio.muted : true, set: v => { if (audio) audio.muted = v; } },
   });
   Object.assign(src, {
-    el: box, isLive: true, info, play, pause, pauseAt, capture, snap, snapDisplayed,
+    el: box, isLive: true, info, play, pause, pauseAt, capture, snap, snapDisplayed, scenes, ask,
     requestVideoFrameCallback: cb => { if (destroyed) return 0; rvfc.push(cb); return rvfc.length; },
     // the film's sound file was rebuilt (scene editor sound levels): load it again, same moment
     // a fresh mix after a sound build; while playing it carries on from the clock (a new src pauses the element)
@@ -215,7 +246,7 @@ export function createLiveSource(info, { onStatus } = {}) {
       load(); wantPlay = wasPlaying;
     },
     fit(w) { scale = w / info.w; if (iframe) iframe.style.transform = `scale(${scale})`; },
-    destroy() { destroyed = true; ready = false; paused = true; wantPlay = false; ++loadVersion; clearInterval(waitTimer); clearTimeout(playTimer); clearSeek(); cancelAnimationFrame(raf); rvfc = []; audio?.pause(); if (audio) { audio.removeAttribute('src'); audio.load(); } iframe?.remove(); win = null; },
+    destroy() { destroyed = true; ready = false; paused = true; wantPlay = false; ++loadVersion; clearInterval(waitTimer); clearTimeout(playTimer); clearSeek(); cancelAnimationFrame(raf); rvfc = []; dropCalls(); window.removeEventListener('message', onMessage); audio?.pause(); if (audio) { audio.removeAttribute('src'); audio.load(); } iframe?.remove(); iframe = null; },
     // the review player calls these on <video>; nothing to do here
     removeAttribute() { }, load() { },
   });
