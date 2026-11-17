@@ -78,8 +78,10 @@ The live preview plays the film from its page in an iframe — no MP4 — and re
 | length | `live.dur` → `render.env.DUR` → the audio file's length → the newest video's length → 60 s (then `hub_live` asks Claude to save `DUR`) |
 | sound | `live.audio` → `audio/mix.wav`, `audio/mix.mp3`, `audio/final.wav`, `audio/master.wav`, `mix.wav`, `audio/mix.m4a` → an `-i` input of `render.mux` → the biggest audio file in `audio/` or the top folder (names with mix/final/master first) → the newest final video |
 
-The page is served at `/live/<id>/…` from the project folder (absolute `src`/`href` and importmap paths are pointed into
-the project). Folders `render, out, snaps, chunks*, node_modules, .videohub, tmp, profiles, vh2d, vhaudio` and
+The page is served at `/live/<id>/…` from the project folder, by a second local server on its own port (absolute
+`src`/`href` and importmap paths are pointed into the project). The page cannot call the hub API. VideoHub puts
+`engine-hooks/vhbridge.js` first in the page and reads `renderOut`, `READY`, the scene hooks and `VH_EDIT` through it.
+The port changes when the hub starts again, so `localStorage` and IndexedDB of a film page do not last. Folders `render, out, snaps, chunks*, node_modules, .videohub, tmp, profiles, vh2d, vhaudio` and
 `tweaks.json` do not trigger a reload.
 
 ## 3. Outputs: how videos are classified

@@ -23,7 +23,7 @@ What film projects must look like is in [PROJECT-CONTRACT.md](PROJECT-CONTRACT.m
 | `server/legacy.js`, `ui/values.js` | Stored values (note/project/thumbnail statuses, note kinds) and the one place old Turkish values are mapped to English. |
 | `server/scan.js` | Projects under the roots, video roles, duplicates, card thumbnails; root watchers so soft scans re-walk only changed projects. |
 | `server/source-revision.js` | A project's code revision (live covers; 409 on stale covers). |
-| `server/live.js` | Live preview: finds the page/fps/size/length/sound, serves `/live/<id>/…`, watches code → SSE `live-changed`. |
+| `server/live.js` | Live preview: finds the page/fps/size/length/sound, serves `/live/<id>/…` on the film server (hub.js), puts the bridge into each page, watches code → SSE `live-changed`. |
 | `server/notes.js` | Review notes (`.videohub/notes.json`), frame pictures cut by ffmpeg in one queue, the agent-directed copied note text. |
 | `server/jobs.js` | Render queue (`data/jobs.json`): one at a time, partial re-renders, concat, sound, versions, `register()`. |
 | `server/media.js` | Film strip, waveform/peaks, full frames, review copies (`data/proxy`). |
@@ -59,8 +59,13 @@ What film projects must look like is in [PROJECT-CONTRACT.md](PROJECT-CONTRACT.m
   after changing it. Keep everything VideoHub reads from the script (PROJECT-CONTRACT.md §4).
 - **Setup never moves or overwrites** the user's folders or an existing `config.json` value; a re-run keeps every answer.
 - **Security:** the server listens on 127.0.0.1 only and refuses requests whose Host is not loopback (DNS rebinding),
-  that a browser marks cross-site (`Sec-Fetch-Site`), and writes with a foreign `Origin`. The job queue can run shell
-  commands (`mode:"command"`), so the port must never be exposed.
+  that a browser marks as from another site (`Sec-Fetch-Site`), or that carry a foreign `Origin`. The job queue can run
+  shell commands (`mode:"command"`), so the port must never be exposed.
+- **Film pages run as another site.** Live preview loads them from a second loopback server on a port the OS picks, so
+  a film's code fails the checks above. The page is a sandboxed iframe (`allow-scripts allow-same-origin`, its own
+  origin). The review window reaches it only through `engine-hooks/vhbridge.js` messages and checks each message's
+  window and origin; a film key event counts only for player keys. UI code never reads the frame's window
+  (`ui/review/isolation.test.js`). Workspace files on the hub (`/media`) carry `Content-Security-Policy: sandbox`.
 - UI details that bit before: `Element.append(null)` prints "null"; a focused `<select>` eats arrow keys; drawing must
   not move focus into the note box; letter shortcuts normalise Turkish `ı`/`İ` to `i`.
 

@@ -69,7 +69,8 @@ export function createLiveSource(info, { onStatus } = {}) {
     clearTimeout(playTimer); playTimer = 0; rvfc = [];
     ready = false; page = null; status({ state: 'loading' });
     const q = `vhparent=${encodeURIComponent(location.origin)}&vh=${Date.now()}`;
-    const f = h('iframe', { class: 'live', src: `${info.url}${info.url.includes('?') ? '&' : '?'}${q}`, scrolling: 'no', tabindex: '-1' });
+    // the film page's own origin stays its own: it may run scripts and load its files, never steer this window
+    const f = h('iframe', { class: 'live', src: `${info.url}${info.url.includes('?') ? '&' : '?'}${q}`, sandbox: 'allow-scripts allow-same-origin', scrolling: 'no', tabindex: '-1' });
     f.style.width = info.w + 'px'; f.style.height = info.h + 'px'; f.style.transform = `scale(${scale})`;
     if (iframe) iframe.replaceWith(f); else box.append(f);
     iframe = f;
@@ -216,7 +217,6 @@ export function createLiveSource(info, { onStatus } = {}) {
       fire('seeking');
     } },
     paused: { get: () => paused && !wantPlay },
-    win: { get: () => iframe?.contentWindow || null },   // the page itself (2D layers: window.VH2D)
     page: { get: () => page },
     pageVersion: { get: () => loadVersion },
     seeking: { get: () => seeking },

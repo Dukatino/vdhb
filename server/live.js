@@ -106,7 +106,7 @@ async function studioInfo(p) {
   let dur = 0, durFrom = 'page';
   if (hasAudio) { try { dur = (await probe(audio)).dur || 0; durFrom = 'audio'; } catch { } }
   // fps, length and size come from the page itself (window.__config) once it loads
-  return { ok: true, page: 'engine/index.html', url: `/live/${p.id}/engine/index.html?scene=${encodeURIComponent(p.name)}`, fps: 60, dur: dur || 10, durFrom, w: 1920, h: 1080,
+  return { ok: true, page: 'engine/index.html', url: `${filmBase}/live/${p.id}/engine/index.html?scene=${encodeURIComponent(p.name)}`, fps: 60, dur: dur || 10, durFrom, w: 1920, h: 1080,
     audio: hasAudio ? '/media?p=' + encodeURIComponent(audio) : null, audioPath: hasAudio ? audio : null, audioName: hasAudio ? `out/${p.name}/audio.wav` : null, chunkSec: null, studio: true };
 }
 export async function liveInfo(p) {
@@ -125,9 +125,13 @@ export async function liveInfo(p) {
   if (!dur) { const last = (p.outputs || []).filter(o => o.dur).sort((a, b) => b.mtime - a.mtime)[0]; if (last) { dur = last.dur; durFrom = 'last video'; } }
   if (!dur) { dur = 60; durFrom = 'default'; }
   const { w, h } = sizeOf(p, rc, page);
-  return { ok: true, revision: codeRevision(p, { fresh: true }), page, url: `/live/${p.id}/${page.split('/').map(encodeURIComponent).join('/')}`, fps, dur: +(+dur).toFixed(3), durFrom, w, h,
+  return { ok: true, revision: codeRevision(p, { fresh: true }), page, url: `${filmBase}/live/${p.id}/${page.split('/').map(encodeURIComponent).join('/')}`, fps, dur: +(+dur).toFixed(3), durFrom, w, h,
     audio: audio ? '/media?p=' + encodeURIComponent(audio) : null, audioPath: audio, audioName: audio ? path.relative(p.path, audio) : null, chunkSec: rc.chunkSec || null };
 }
+
+// Where film pages are served: the hub's film server, on its own port (see hub.js).
+let filmBase = '';
+export function setFilmBase(base) { filmBase = base; }
 
 // The VideoHub window that may talk to a film page: a loopback origin on the hub's own port, from ?vhparent=.
 export function parentOrigin(reqUrl, hubPort) {

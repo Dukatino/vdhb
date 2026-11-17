@@ -75,6 +75,8 @@ function allowedFile(p) {
   const roots = config().roots.map(r => r.path).concat([config().archiveDir, media.PROXY, ts.globalDir, ts.templatesDir, ts.styleRefsDir].filter(Boolean));
   return roots.some(r => isInside(p, r));
 }
+// a workspace file opened straight in the browser (an .html or .svg) must not run script as this origin
+const FILE_HEAD = { 'Content-Security-Policy': 'sandbox', 'X-Content-Type-Options': 'nosniff' };
 function serveFile(req, res, file) {
   let st; try { st = fs.statSync(file); } catch { return send(res, 404, { error: 'not found' }); }
   const type = MIME[path.extname(file).toLowerCase()] || 'application/octet-stream';
@@ -83,10 +85,10 @@ function serveFile(req, res, file) {
   if (m && (m[1] || m[2])) {
     const a = m[1] ? +m[1] : Math.max(0, st.size - +m[2]), b = m[1] && m[2] ? Math.min(+m[2], st.size - 1) : st.size - 1;
     if (a >= st.size || b < a) { res.writeHead(416, { 'Content-Range': `bytes */${st.size}`, 'Accept-Ranges': 'bytes' }); return res.end(); }
-    res.writeHead(206, { 'Content-Type': type, 'Content-Range': `bytes ${a}-${b}/${st.size}`, 'Accept-Ranges': 'bytes', 'Content-Length': b - a + 1 });
+    res.writeHead(206, { ...FILE_HEAD, 'Content-Type': type, 'Content-Range': `bytes ${a}-${b}/${st.size}`, 'Accept-Ranges': 'bytes', 'Content-Length': b - a + 1 });
     fs.createReadStream(file, { start: a, end: b }).on('error', () => res.destroy()).pipe(res);
   } else {
-    res.writeHead(200, { 'Content-Type': type, 'Content-Length': st.size, 'Accept-Ranges': 'bytes' });
+    res.writeHead(200, { ...FILE_HEAD, 'Content-Type': type, 'Content-Length': st.size, 'Accept-Ranges': 'bytes' });
     fs.createReadStream(file).on('error', () => res.destroy()).pipe(res);
   }
 }
@@ -411,6 +413,7 @@ if (!GUARD_OFF) alwaysOn().then(on => { if (on) ensureGuard().catch(() => { }); 
 
 // only this PC's own pages and tools: a page on another website (or a DNS name pointed at 127.0.0.1) must not drive
 // the hub — its job queue can run commands. Claude's MCP tools, RenderGuard and scripts send no Origin/Sec-Fetch-Site.
+// Film pages are such another page too: they come from the film server below, on its own port.
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]']);
 function foreign(req) {
   const host = String(req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
@@ -418,7 +421,7 @@ function foreign(req) {
   const sfs = req.headers['sec-fetch-site'];
   if (sfs && sfs !== 'same-origin' && sfs !== 'none') return 'site';
   const origin = req.headers.origin;
-  if (origin && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+  if (origin) {
     let o = null; try { o = new URL(origin); } catch { }
     if (!o || !LOOPBACK.has(o.hostname.toLowerCase().replace(/^\[(.*)\]$/, '[$1]')) || String(o.port || '80') !== String(server.address()?.port)) return 'origin';
   }
@@ -438,16 +441,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method !== 'GET') return send(res, 404, { error: 'not found' });
-    // a film page for live preview: /live/<project id>/<file>; absolute URLs from such a page land here via its Referer
-    if (url.pathname.startsWith('/live/')) {
-      const [, , pid, ...rest] = url.pathname.split('/'), lp = project(pid);
-      if (!lp) return send(res, 404, { error: 'not found' });
-      return live.serve(req, res, lp, rest.join('/'), { hubPort: server.address()?.port });
-    }
-    if (url.pathname === '/__vh/bridge.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' }); return fs.createReadStream(live.BRIDGE_FILE).on('error', () => res.destroy()).pipe(res); }
-    // (browsers don't always send a Referer for module imports, so the cookie set by /live/<id>/... decides too)
-    const ref = (req.headers.referer || '').match(/\/live\/([0-9a-f]{12})\//) || (req.headers.cookie || '').match(/(?:^|;\s*)vhlive=([0-9a-f]{12})/);
-    if (ref && !fs.existsSync(path.join(UI, decodeURIComponent(url.pathname)))) { const lp = project(ref[1]); if (lp && fs.existsSync(path.join(lp.studio || lp.path, decodeURIComponent(url.pathname)))) return live.serve(req, res, lp, url.pathname.slice(1)); }
     // static UI
     let f = path.join(UI, decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname));
     if (!isInside(f, UI) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) f = path.join(UI, 'index.html');
@@ -458,10 +451,32 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// Film pages for live preview, on their own local port: a film's code runs as another site, so the checks above keep
+// it away from this API. It serves only GET of project files and the bridge (engine-hooks/vhbridge.js).
+const filmServer = http.createServer((req, res) => {
+  const no = code => { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(String(code)); };
+  try {
+    if (!LOOPBACK.has(String(req.headers.host || '').toLowerCase().replace(/:\d+$/, ''))) return no(403);
+    if (req.method !== 'GET' && req.method !== 'HEAD') return no(405);
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (url.pathname === '/__vh/bridge.js') { res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' }); return fs.createReadStream(live.BRIDGE_FILE).on('error', () => res.destroy()).pipe(res); }
+    if (url.pathname.startsWith('/live/')) {
+      const [, , pid, ...rest] = url.pathname.split('/'), lp = project(pid);
+      return lp ? live.serve(req, res, lp, rest.join('/'), { hubPort: server.address()?.port }) : no(404);
+    }
+    // absolute URLs from a film page (/data/…, an importmap's /node_modules/…) land here: its Referer names the project,
+    // or the cookie set by /live/<id>/… when the browser sends no Referer (module imports)
+    const ref = (req.headers.referer || '').match(/\/live\/([0-9a-f]{12})\//) || (req.headers.cookie || '').match(/(?:^|;\s*)vhlive=([0-9a-f]{12})/);
+    const lp = ref && project(ref[1]);
+    if (lp && fs.existsSync(path.join(lp.studio || lp.path, decodeURIComponent(url.pathname)))) return live.serve(req, res, lp, url.pathname.slice(1));
+    return no(404);
+  } catch { if (!res.headersSent) no(500); else res.destroy(); }
+});
+
 const port = +(process.env.VIDEOHUB_PORT || config().port || 7788);
 server.on('error', e => { if (e.code === 'EADDRINUSE') { console.error(`VideoHub is already running (port ${port}).`); process.exit(0); } throw e; });
-server.listen(port, '127.0.0.1', () => {
+filmServer.listen(0, '127.0.0.1', () => { live.setFilmBase('http://127.0.0.1:' + filmServer.address().port); server.listen(port, '127.0.0.1', () => {
   console.log(`VideoHub: http://127.0.0.1:${port}`);
   if (!index().at || index().projects.length === 0) scan().catch(e => console.error('scan:', e.message)); else scan().catch(() => { });
   if (process.env.VIDEOHUB_JOBS !== 'off') jobs.resume();   // test instances never pick up the real render queue
-});
+}); });
