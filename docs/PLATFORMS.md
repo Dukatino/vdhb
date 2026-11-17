@@ -28,7 +28,7 @@ Windows remains the established platform. Linux and macOS support are **new, not
 | Video encoders | NVENC, AMF, QSV, x264; short encode probes decide availability | NVENC, VAAPI, QSV, x264; short encode probes decide availability | VideoToolbox and x264; Apple Silicon quality / Intel bitrate candidates probed |
 | Render template browser lookup | Existing paths plus `VIDEOHUB_BROWSER` | Native browser paths plus `VIDEOHUB_BROWSER` | Application browser paths plus `VIDEOHUB_BROWSER` |
 | Install, update and uninstall | Shared Node lifecycle installer; `.cmd` entry points and optional policy-respecting `.ps1` forwarders | `setup.sh`, `update.sh`, `uninstall.sh` | Same Bash scripts with macOS paths and Homebrew hints |
-| Desktop launcher | Node-based shortcut (minimized) or `open.cmd`; a console may appear briefly | Desktop entry with SVG icon | Optional executable `VideoHub.command`; no `.app` bundle |
+| Desktop launcher | Node-based shortcut (minimized) or `open.cmd`; a console may appear briefly | Desktop entry with SVG icon | Optional `VideoHub.app`, written and ad-hoc signed by setup |
 | Claude Code integration | CLI MCP registration, skill and managed global rule | Same integrations through shared Node helper | Same integrations through shared Node helper |
 | OpenCode integration | CLI MCP registration; JSONC-tolerant fallback only if CLI is absent; skill and managed rule | Same integrations through shared Node helper | Same integrations through shared Node helper |
 
@@ -46,7 +46,7 @@ Trash helpers are optional. The Node fallback writes restorable `.trashinfo` met
 
 ## macOS permissions and limits
 
-The optional Desktop `VideoHub.command` launcher opens Terminal briefly. No unsigned `.app` bundle is created. After a blocked first launch, use System Settings → Privacy & Security → Open Anyway, then open the launcher again; `bash open.sh` from the installation is an alternative.
+The optional Desktop `VideoHub.app` launcher opens no Terminal window. Setup writes it on the Mac and signs it ad hoc with `codesign -s -`; it holds only `Info.plist` and a script, and it shows start-up errors in an alert. Setup and update replace an owned `VideoHub.command`; uninstall moves the owned app to Trash. `bash open.sh` from the installation is an alternative.
 
 Finder may request Automation permission when VideoHub first sends files to Trash. If permission is denied or Finder reports an error, VideoHub keeps the source and reports the refusal. It does not fall back to permanent deletion. macOS has no supported CPU-core affinity API, so the Renders page hides core-power controls while retaining niceness, background QoS and RAM protection.
 
@@ -62,9 +62,9 @@ Setup can target Claude Code, OpenCode or both. Skills share one source file and
 - Linux CPU affinity without `taskset`, and CPU affinity on macOS; priority and RAM protection still work.
 - Guaranteed restoration of Unix niceness without the required privileges; no elevated helper is installed.
 - Permanent deletion as a fallback for an unavailable Trash or Recycle Bin.
-- Native modules, compiled helper programs and unsigned `.app` bundles.
+- Native modules, compiled helper programs and `.app` bundles in the source distribution.
 - Renders made from an older template are not rewritten. Their own browser lookup may need updating or the script may need to honor `VIDEOHUB_BROWSER`.
 
 ## Real-machine acceptance still required
 
-On Ubuntu 24.04 desktop, install from a fresh clone, open the example in live preview, send a note, render once with sound after approving the preview, inspect priority and `taskset`, stop a render with children, restore a deleted folder from Trash, update while retaining data, and uninstall. Repeat installation, live preview, notes, one sound render, priority/background QoS, whole-tree Stop, Trash restore, data-preserving update and uninstall on Apple Silicon and, if available, Intel macOS. Verify the `.command` first launch, Finder Automation prompt, LaunchAgent login startup and hidden CPU sliders. Confirm a real OpenCode session exposes the `hub_*` tools on each platform; verify Claude Code integration as well. These desktop, permissions, rendering and performance checks were not executed on Linux/macOS during the Windows implementation run.
+On Ubuntu 24.04 desktop, install from a fresh clone, open the example in live preview, send a note, render once with sound after approving the preview, inspect priority and `taskset`, stop a render with children, restore a deleted folder from Trash, update while retaining data, and uninstall. Repeat installation, live preview, notes, one sound render, priority/background QoS, whole-tree Stop, Trash restore, data-preserving update and uninstall on Apple Silicon and, if available, Intel macOS. Verify the `VideoHub.app` first launch, Finder Automation prompt, LaunchAgent login startup and hidden CPU sliders. Confirm a real OpenCode session exposes the `hub_*` tools on each platform; verify Claude Code integration as well. These desktop, permissions, rendering and performance checks were not executed on Linux/macOS during the Windows implementation run.

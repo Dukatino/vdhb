@@ -70,7 +70,7 @@ Run `chmod +x setup.sh update.sh uninstall.sh open.sh`, then `./setup.sh`. Previ
 
 Flags: `--yes`, `--workspace PATH`, `--agents claude,opencode`, and `--watch-found`, `--gpu-encoder`, `--global-rule`, `--shortcut`, `--startup`, `--example` with `yes` or `no`. Launch with `./open.sh`. Linux also installs an application desktop entry and can add a Desktop copy.
 
-On macOS the optional Desktop launcher is **VideoHub.command**, which briefly opens Terminal. There is no unsigned `.app` bundle. If macOS blocks the downloaded launcher, attempt to open it, then go to **System Settings → Privacy & Security → Open Anyway**, confirm, and open it again. You can also launch with `./open.sh` from the installed folder.
+On macOS the optional Desktop launcher is **VideoHub.app**. Setup writes it on your Mac and signs it ad hoc, so it opens with no Terminal window. It holds only a settings file and a short script; nothing compiled is shipped. If VideoHub cannot start, the app shows the error in an alert. You can also launch with `./open.sh` from the installed folder.
 
 ### Claude Code and OpenCode
 Setup detects the installed agents. Select one or both with `--agents claude,opencode` on every platform; legacy Windows `-Agents` spelling remains accepted. Each receives its own local MCP registration, the shared skill and the optional marked review rule. Restart the selected agent after setup.
@@ -139,7 +139,7 @@ Only integrations owned by this install are removed: MCP entry, skill, managed r
 
 ## Troubleshooting
 - **macOS Trash permission** — Finder may ask for Automation permission the first time VideoHub moves a file to Trash. Allow it in System Settings → Privacy & Security → Automation for the requesting terminal/process. If denied, VideoHub refuses the operation and keeps the source; it never falls back to permanent deletion.
-- **macOS launcher blocked** — use Privacy & Security → Open Anyway after the first blocked launch of `VideoHub.command`, or run `./open.sh`. No `.app` bundle is shipped.
+- **macOS launcher shows an error or does nothing** — run `./open.sh` from the installed folder to see the full message. After a Node.js upgrade, run setup again so the app points at the new Node.
 - **macOS Render power is missing** — macOS has no supported CPU-core limit. Low priority, background QoS and RAM protection remain available; the Renders page explains the limitation.
 - **Linux folder picker is unavailable** — install `zenity`/`kdialog`, or enter the path in the text field.
 - **Linux CPU limit unavailable** — install `taskset` (util-linux). Low priority and RAM watching still work. Raising Unix priority after slowing down may require privileges; a fresh render starts with its configured priority.

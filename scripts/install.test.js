@@ -19,7 +19,7 @@ function fixture(os = 'linux', installName = 'install') {
   const env = { PATH: '', XDG_CONFIG_HOME: path.join(home, '.config'), XDG_DATA_HOME: path.join(home, '.local', 'share'), VIDEOHUB_DATA_DIR: path.join(hub, 'data'), VIDEOHUB_PORT: '7799', VIDEOHUB_NO_WINDOW: '1' };
   const calls = [], platform = { OS: 'linux', IS_WIN: false, IS_MAC: false, IS_LINUX: true, dirs: { home, config: path.join(home, '.config', 'videohub'), desktop: path.join(home, 'Desktop') }, findTool: () => null, findBrowser: () => ({ path: null }), desktopEntry: () => '[Desktop Entry]\nName=VideoHub\nExec="/home/me/VideoHub/open.sh"\n', pathKey: p => path.resolve(p), processList: async () => [], getAutostart: async () => false, setAutostart: async on => { calls.push(['startup', on]); return { code: 0 }; }, trash: async a => { calls.push(['trash', a]); return a.map(p => ({ path: p, ok: true })); }, openUrlWindow: u => calls.push(['open', u]) };
   if (os === 'darwin') { platform.OS = 'darwin'; platform.IS_MAC = true; platform.IS_LINUX = false; platform.dirs.config = path.join(home, 'Library', 'Application Support', 'VideoHub'); platform.desktopEntry = () => { throw new Error('macOS must not create a desktop entry'); }; }
-  return { hub, home, workspace, env, platform, calls, log: () => {}, launch: false, discover: () => [], run: () => { throw new Error('No package or external command may run in this test'); } };
+  return { hub, home, workspace, env, platform, calls, log: () => {}, launch: false, discover: () => [], run: () => { throw new Error('No package or external command may run in this test'); }, sign: app => { calls.push(['sign', app]); return { status: 0 }; } };
 }
 test('shell options accept every guided answer and reject typos before changes', () => {
   const r = parseOptions(['setup', '--dry-run', '--yes', '--agents', 'claude,opencode', '--workspace', '/home/me/work', '--watch-found', 'no', '--gpu-encoder', 'yes', '--global-rule', 'yes', '--shortcut', 'no', '--startup', 'no', '--example', 'yes']); assert.equal(r.agents, 'claude,opencode'); assert.equal(r['dry-run'], true);
@@ -62,21 +62,42 @@ test('launcher starts a detached local server and opens the window; server flag 
   await runInstaller({ action: 'open' }, overrides); assert.equal(spawned.length, 1); assert.equal(spawned[0].opts.detached, true); assert.deepEqual(spawned[0].args, [path.join(o.hub, 'server', 'hub.js')]); assert.deepEqual(o.calls, [['open', 'http://127.0.0.1:7799']]);
   polls = 0; o.calls.length = 0; await runInstaller({ action: 'open', server: true }, overrides); assert.deepEqual(o.calls, []);
 });
-test('macOS dry-run gives Homebrew hints and writes no Desktop command or Library settings', async () => {
+test('macOS dry-run gives Homebrew hints and writes no Desktop app or Library settings', async () => {
   const o = fixture('darwin'), r = await runInstaller({ action: 'setup', yes: true, 'dry-run': true, workspace: o.workspace, agents: 'opencode' }, o);
-  assert.ok(r.warnings.some(s => /brew install node ffmpeg/.test(s))); assert.ok(r.warnings.some(s => /brew install --cask google-chrome/.test(s))); assert.ok(r.actions.some(s => /VideoHub\.command/.test(s))); assert.ok(!r.actions.some(s => /videohub\.desktop/i.test(s))); assert.equal(fs.existsSync(path.join(o.home, 'Library')), false); assert.equal(fs.existsSync(path.join(o.home, 'Desktop', 'VideoHub.command')), false);
+  assert.ok(r.warnings.some(s => /brew install node ffmpeg/.test(s))); assert.ok(r.warnings.some(s => /brew install --cask google-chrome/.test(s))); assert.ok(r.actions.some(s => /VideoHub\.app/.test(s))); assert.ok(!r.actions.some(s => /videohub\.desktop/i.test(s))); assert.equal(fs.existsSync(path.join(o.home, 'Library')), false); assert.equal(fs.existsSync(path.join(o.home, 'Desktop', 'VideoHub.app')), false); assert.ok(!o.calls.some(c => c[0] === 'sign'));
 });
-test('macOS setup creates a quoted executable Desktop command and Library installation record', async () => {
+test('macOS setup writes a signed script-only Desktop app with quoted paths and a Library installation record', async () => {
   const o = fixture('darwin', "VideoHub's copy"); await runInstaller({ action: 'setup', yes: true, workspace: o.workspace, agents: 'opencode' }, o);
-  const command = path.join(o.home, 'Desktop', 'VideoHub.command'), text = fs.readFileSync(command, 'utf8'); assert.ok(text.startsWith('#!/bin/bash\n')); assert.ok(text.includes('# VideoHub install: ' + o.hub + '\n')); assert.ok(text.includes('/opt/homebrew/bin:/usr/local/bin:$PATH')); assert.ok(text.includes("exec '" + process.execPath.replaceAll("'", "'\\''") + "' '" + path.join(o.hub, 'scripts', 'install.mjs').replaceAll("'", "'\\''") + "' open \"$@\""));
-  if (!IS_WIN) assert.ok(fs.statSync(command).mode & 0o111);
+  const app = path.join(o.home, 'Desktop', 'VideoHub.app'), script = path.join(app, 'Contents', 'MacOS', 'VideoHub'), text = fs.readFileSync(script, 'utf8'), plist = fs.readFileSync(path.join(app, 'Contents', 'Info.plist'), 'utf8');
+  assert.ok(text.startsWith('#!/bin/bash\n')); assert.ok(text.includes('# VideoHub install: ' + o.hub + '\n')); assert.ok(text.includes('/opt/homebrew/bin:/usr/local/bin:$PATH'));
+  assert.ok(text.includes("err=$('" + process.execPath.replaceAll("'", "'\\''") + "' '" + path.join(o.hub, 'scripts', 'install.mjs').replaceAll("'", "'\\''") + "' open 2>&1 >/dev/null) && exit 0"));
+  assert.ok(text.includes('-- "${err:-')); assert.ok(plist.includes('<key>CFBundleExecutable</key><string>VideoHub</string>')); assert.ok(plist.includes('<key>LSUIElement</key><true/>')); assert.ok(!plist.includes(o.hub));
+  assert.deepEqual(fs.readdirSync(path.join(app, 'Contents')).sort(), ['Info.plist', 'MacOS']); assert.deepEqual(fs.readdirSync(path.join(app, 'Contents', 'MacOS')), ['VideoHub']);
+  assert.ok(o.calls.some(c => c[0] === 'sign' && c[1] === app)); assert.equal(fs.existsSync(path.join(o.home, 'Desktop', 'VideoHub.command')), false);
+  if (!IS_WIN) { assert.ok(fs.statSync(script).mode & 0o111); const bash = spawnSync('bash', ['-n', script], { encoding: 'utf8' }); if (!bash.error) assert.equal(bash.status, 0, bash.stderr); }
   assert.ok(fs.existsSync(path.join(o.home, 'Library', 'Application Support', 'VideoHub', 'install.json'))); assert.equal(fs.existsSync(path.join(o.home, '.local', 'share', 'applications')), false);
-  o.calls.length = 0; await runInstaller({ action: 'uninstall' }, { ...o, request: async () => null }); assert.ok(o.calls.some(c => c[0] === 'startup' && c[1] === false)); assert.ok(o.calls.some(c => c[0] === 'trash' && c[1].includes(command))); assert.ok(fs.existsSync(path.join(o.workspace, 'films', 'hello-film', 'index.html')));
+  o.calls.length = 0; await runInstaller({ action: 'uninstall' }, { ...o, request: async () => null }); assert.ok(o.calls.some(c => c[0] === 'startup' && c[1] === false)); assert.ok(o.calls.some(c => c[0] === 'trash' && c[1].includes(app))); assert.ok(fs.existsSync(path.join(o.workspace, 'films', 'hello-film', 'index.html')));
 });
-test('macOS setup and uninstall leave another installation\'s Desktop command unchanged', async () => {
-  const o = fixture('darwin'), command = path.join(o.home, 'Desktop', 'VideoHub.command'), foreign = '#!/bin/bash\n# VideoHub install: /other-install\n'; write(command, foreign);
-  const r = await runInstaller({ action: 'setup', yes: true, workspace: o.workspace, agents: 'opencode' }, o); assert.ok(r.warnings.some(s => /another install/.test(s))); assert.equal(fs.readFileSync(command, 'utf8'), foreign);
-  o.calls.length = 0; await runInstaller({ action: 'uninstall' }, { ...o, request: async () => null }); assert.ok(!o.calls.some(c => c[0] === 'trash' && c[1].includes(command)));
+test('macOS setup keeps going with a warning when ad-hoc signing fails', async () => {
+  const o = fixture('darwin'), r = await runInstaller({ action: 'setup', yes: true, workspace: o.workspace, agents: 'opencode' }, { ...o, sign: () => ({ status: 1, stderr: 'no access' }) });
+  assert.ok(r.warnings.some(s => /Could not sign the launcher app.*no access/.test(s))); assert.ok(fs.existsSync(path.join(o.home, 'Desktop', 'VideoHub.app', 'Contents', 'MacOS', 'VideoHub')));
+});
+test('macOS setup and update replace this install\'s old Desktop command with the app', async () => {
+  const o = fixture('darwin'), command = path.join(o.home, 'Desktop', 'VideoHub.command'); write(command, '#!/bin/bash\n# VideoHub install: ' + o.hub + '\n');
+  await runInstaller({ action: 'setup', yes: true, workspace: o.workspace, agents: 'opencode' }, o); assert.ok(o.calls.some(c => c[0] === 'trash' && c[1].includes(command))); assert.ok(fs.existsSync(path.join(o.home, 'Desktop', 'VideoHub.app')));
+  const u = fixture('darwin'), target = path.join(path.dirname(u.hub), 'target'), old = path.join(u.home, 'Desktop', 'VideoHub.command'); write(path.join(target, 'server', 'hub.js'), '// old hub'); write(old, '#!/bin/bash\n# VideoHub install: ' + target + '\n');
+  for (const m of ['@modelcontextprotocol/sdk', 'puppeteer-core']) write(path.join(target, 'node_modules', m, 'package.json'));
+  await runInstaller({ action: 'update', target }, { ...u, env: { ...u.env, VIDEOHUB_DATA_DIR: '' }, request: async () => null });
+  assert.ok(fs.readFileSync(path.join(u.home, 'Desktop', 'VideoHub.app', 'Contents', 'MacOS', 'VideoHub'), 'utf8').includes('# VideoHub install: ' + target + '\n')); assert.ok(u.calls.some(c => c[0] === 'trash' && c[1].includes(old))); assert.ok(u.calls.some(c => c[0] === 'sign'));
+});
+test('macOS setup, update and uninstall leave another installation\'s app and command unchanged', async () => {
+  const o = fixture('darwin'), command = path.join(o.home, 'Desktop', 'VideoHub.command'), script = path.join(o.home, 'Desktop', 'VideoHub.app', 'Contents', 'MacOS', 'VideoHub'), foreign = '#!/bin/bash\n# VideoHub install: /other-install\n'; write(command, foreign); write(script, foreign);
+  const r = await runInstaller({ action: 'setup', yes: true, workspace: o.workspace, agents: 'opencode' }, o); assert.ok(r.warnings.some(s => /another install/.test(s))); assert.equal(fs.readFileSync(command, 'utf8'), foreign); assert.equal(fs.readFileSync(script, 'utf8'), foreign); assert.ok(!o.calls.some(c => c[0] === 'sign' || c[0] === 'trash'));
+  o.calls.length = 0; await runInstaller({ action: 'uninstall' }, { ...o, request: async () => null }); assert.ok(!o.calls.some(c => c[0] === 'trash' && (c[1].includes(command) || c[1].some(f => f.endsWith('VideoHub.app')))));
+});
+test('macOS setup refuses to write through a symbolic link at the Desktop app path', { skip: IS_WIN }, async () => {
+  const o = fixture('darwin'), elsewhere = path.join(path.dirname(o.home), 'elsewhere'); fs.mkdirSync(elsewhere); fs.symlinkSync(elsewhere, path.join(o.home, 'Desktop', 'VideoHub.app'));
+  const r = await runInstaller({ action: 'setup', yes: true, workspace: o.workspace, agents: 'opencode' }, o); assert.ok(r.warnings.some(s => /another install/.test(s))); assert.deepEqual(fs.readdirSync(elsewhere), []);
 });
 test('updater identifies only direct Node hub launches and refuses nested source/target folders', async () => {
   const o = fixture(), target = path.join(path.dirname(o.hub), 'target'); write(path.join(target, 'server', 'hub.js'), '// old');

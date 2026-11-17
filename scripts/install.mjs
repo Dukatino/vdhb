@@ -136,7 +136,7 @@ export async function retireLegacyAgent({ install, platform, stopPid, delay, dry
   if (present.length) { onAction('move retired legacy files to the Recycle Bin: ' + present.map(f => path.relative(install, f)).join(', ')); const result = await platform.trash(present); if (result.some(r => !r.ok) || result.length !== present.length) throw new Error('Some legacy helper files could not be moved to the Recycle Bin; no deletion fallback was used'); }
   await platform.cleanupLegacyAutostart?.();
 }
-export async function runInstaller(options, { hub = ROOT, platform = platformDefault, env = process.env, log = console.log, ask, run = (f, a, opts) => spawnSync(f, a, { stdio: 'inherit', ...opts }), request = async url => { try { const r = await fetch(url, { signal: AbortSignal.timeout(1500) }); return r.ok ? await r.json() : null; } catch { return null; } }, spawnServer = (f, a, opts) => spawn(f, a, opts), stopPid = pid => process.kill(pid, 'SIGTERM'), delay = ms => new Promise(r => setTimeout(r, ms)), agents = integrateAgents, discover, encoderDetect = detectEncoders, launch = true, platformForInstall = install => platformDefault.createPlatform({ hubDir: install, env, home: platform.dirs.home }), resolveInstall = fs.realpathSync } = {}) {
+export async function runInstaller(options, { hub = ROOT, platform = platformDefault, env = process.env, log = console.log, ask, run = (f, a, opts) => spawnSync(f, a, { stdio: 'inherit', ...opts }), request = async url => { try { const r = await fetch(url, { signal: AbortSignal.timeout(1500) }); return r.ok ? await r.json() : null; } catch { return null; } }, spawnServer = (f, a, opts) => spawn(f, a, opts), stopPid = pid => process.kill(pid, 'SIGTERM'), delay = ms => new Promise(r => setTimeout(r, ms)), agents = integrateAgents, discover, encoderDetect = detectEncoders, launch = true, platformForInstall = install => platformDefault.createPlatform({ hubDir: install, env, home: platform.dirs.home }), resolveInstall = fs.realpathSync, sign = app => spawnSync('codesign', ['--force', '--sign', '-', app], { encoding: 'utf8' }) } = {}) {
   const dry = !!options['dry-run'], quiet = dry || options.yes, home = platform.dirs.home, data = env.VIDEOHUB_DATA_DIR || path.join(hub, 'data');
   const actions = [], warnings = [], say = s => { actions.push((dry ? 'would ' : '') + s); log((dry ? '[dry run] ' : '') + s); };
   const warn = s => { warnings.push(s); log(s); };
@@ -153,6 +153,28 @@ export async function runInstaller(options, { hub = ROOT, platform = platformDef
   const desktopFile = path.join(platform.dirs.desktop, platform.IS_MAC ? 'VideoHub.command' : 'VideoHub.desktop');
   const shellQuote = s => "'" + String(s).replaceAll("'", "'\\''") + "'";
   const owned = (f, install) => { try { return fs.readFileSync(f, 'utf8').includes('# VideoHub install: ' + install + '\n'); } catch { return false; } };
+  // macOS launcher: an app bundle that setup writes on this Mac and signs ad hoc. It holds only Info.plist and a script.
+  const macApp = path.join(platform.dirs.desktop, 'VideoHub.app'), macAppScript = path.join(macApp, 'Contents', 'MacOS', 'VideoHub');
+  const isLink = f => { try { return fs.lstatSync(f).isSymbolicLink(); } catch { return false; } };
+  const ownedApp = install => !isLink(macApp) && owned(macAppScript, install);
+  const macAppEntry = install => '#!/bin/bash\n# VideoHub install: ' + install + '\nexport PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"\n'
+    + 'err=$(' + shellQuote(process.execPath) + ' ' + shellQuote(path.join(install, 'scripts', 'install.mjs')) + ' open 2>&1 >/dev/null) && exit 0\n'
+    + '/usr/bin/osascript -e \'on run argv\' -e \'display alert "VideoHub could not start" message (item 1 of argv)\' -e \'end run\' -- "${err:-Run bash open.sh in the VideoHub folder to see the error.}" >/dev/null 2>&1\nexit 1\n';
+  const macAppPlist = '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n'
+    + '<key>CFBundleName</key><string>VideoHub</string>\n<key>CFBundleIdentifier</key><string>com.videohub.launcher</string>\n<key>CFBundleExecutable</key><string>VideoHub</string>\n'
+    + '<key>CFBundlePackageType</key><string>APPL</string>\n<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n<key>LSUIElement</key><true/>\n</dict></plist>\n';
+  const writeMacApp = install => {
+    if (isLink(macApp) || fs.existsSync(macApp) && !ownedApp(install)) { warn('Launcher app belongs to another install; left unchanged: ' + macApp); return false; }
+    say('write and sign launcher app ' + macApp); if (dry) return true;
+    try { write(path.join(macApp, 'Contents', 'Info.plist'), macAppPlist); write(macAppScript, macAppEntry(install), 0o755); } catch (e) { warn('Could not write the launcher app: ' + e.message); return false; }
+    const r = sign(macApp); if (r?.status !== 0) warn('Could not sign the launcher app; it still opens on this Mac. ' + String(r?.stderr || r?.error?.message || '').trim().slice(0, 200));
+    return true;
+  };
+  const retireMacCommand = async install => {
+    if (!owned(desktopFile, install)) return;
+    say('move the old launcher to Trash: ' + desktopFile); if (dry) return;
+    const r = await platform.trash([desktopFile]); if (!r[0]?.ok) warn(r[0]?.error || 'Could not move the old launcher to Trash');
+  };
   const referencesClear = (state, install) => {
     if (state?.error) return false; if (!state?.exists || state.owned) return true; if (!state.install) return false;
     try { return casePath(resolveInstall(state.install), platform) !== casePath(resolveInstall(install), platform); } catch { return false; }
@@ -237,14 +259,16 @@ export async function runInstaller(options, { hub = ROOT, platform = platformDef
       let legacyLaunchersSafe = referencesClear(priorShortcut, hub) && (!priorShortcut?.owned || makeShortcut);
       if (platform.IS_WIN) {
         if (makeShortcut) { say('create or refresh the owned Desktop shortcut through the installed Node runtime'); if (!dry) try { await platform.setShortcut(true); } catch (e) { legacyLaunchersSafe = false; warn(e.message); } }
+      } else if (platform.IS_MAC) {
+        if (makeShortcut && writeMacApp(hub)) await retireMacCommand(hub);
       } else {
-        const entry = platform.IS_MAC ? '#!/bin/bash\n# VideoHub install: ' + hub + '\nset -euo pipefail\nexport PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"\nexec ' + shellQuote(process.execPath) + ' ' + shellQuote(path.join(hub, 'scripts', 'install.mjs')) + ' open "$@"\n' : '# VideoHub install: ' + hub + '\n' + platform.desktopEntry(false);
-        for (const f of [...(platform.IS_MAC ? [] : [entryFile]), ...(makeShortcut ? [desktopFile] : [])]) {
+        const entry = '# VideoHub install: ' + hub + '\n' + platform.desktopEntry(false);
+        for (const f of [entryFile, ...(makeShortcut ? [desktopFile] : [])]) {
           if (fs.existsSync(f) && !owned(f, hub)) { warn('Shortcut belongs to another install; left unchanged: ' + f); continue; }
           say('write launcher ' + f); if (!dry) write(f, entry, 0o755);
         }
       }
-      if (platform.IS_MAC && makeShortcut) log('The Desktop VideoHub.command opens Terminal briefly. If macOS blocks its first launch, use Open Anyway in Privacy & Security, then open it again.');
+      if (platform.IS_MAC && makeShortcut) log('Open VideoHub with VideoHub.app on the Desktop.');
       const priorStartupState = platform.IS_WIN ? await startupDetails(platform, hub) : null, priorStartup = !!priorStartupState?.owned;
       if (platform.IS_WIN) { legacyLaunchersSafe &&= referencesClear(priorStartupState, hub); if (priorStartupState.error) warn(priorStartupState.error); }
       const startup = await yesNo('startup', 'Start VideoHub quietly when you log in?', false, priorStartup ? { ...saved, startup: 'yes' } : saved); answers.startup = startup ? 'yes' : 'no';
@@ -297,6 +321,7 @@ export async function runInstaller(options, { hub = ROOT, platform = platformDef
         if (!legacyLaunchersSafe) warnRetainedLaunchers(target);
         await retireLegacyAgent({ install: target, platform: installed, stopPid, delay, dryRun: dry, launchers: legacyLaunchersSafe, onAction: say });
       }
+      if (platform.IS_MAC && (ownedApp(target) || owned(desktopFile, target)) && writeMacApp(target)) await retireMacCommand(target);
       log('Update complete. Open VideoHub with its existing launcher and restart your agent session.'); return { actions, warnings };
     }
     await stopInstall(hub);
@@ -311,7 +336,7 @@ export async function runInstaller(options, { hub = ROOT, platform = platformDef
       if (shortcut.owned) { say('move this install\'s Desktop shortcut to the Recycle Bin'); if (!dry) try { await platform.setShortcut(false); } catch (e) { legacyLaunchersSafe = false; warn(e.message); } }
       if (!legacyLaunchersSafe) warnRetainedLaunchers(hub);
       await retireLegacyAgent({ install: hub, platform, stopPid, delay, dryRun: dry, launchers: legacyLaunchersSafe, onAction: say });
-    } else for (const f of [...(platform.IS_MAC ? [] : [entryFile]), desktopFile]) if (owned(f, hub)) { say('move launcher to Trash: ' + f); if (!dry) { const r = await platform.trash([f]); if (!r[0]?.ok) warn(r[0]?.error || 'Could not move launcher to Trash'); } }
+    } else for (const f of [...(platform.IS_MAC ? [macApp] : [entryFile]), desktopFile]) if (f === macApp ? ownedApp(hub) : owned(f, hub)) { say('move launcher to Trash: ' + f); if (!dry) { const r = await platform.trash([f]); if (!r[0]?.ok) warn(r[0]?.error || 'Could not move launcher to Trash'); } }
     if (casePath(read(markerFile, {})?.hub || '', platform) === casePath(hub, platform)) { say('move installation record to Trash'); if (!dry) await platform.trash([markerFile]); }
     log('Uninstall complete. Your films, notes, outputs, settings and the program folder remain.'); return { actions, warnings };
   } finally { reader?.close(); }
