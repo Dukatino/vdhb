@@ -31,6 +31,20 @@ test('no UI code reaches into the film page window', () => {
   assert.deepEqual(bad, []);
 });
 
+// film text (errors, scene and object names, labels) reaches the UI; it must stay text, never markup
+test('the UI parses no text as HTML except its own fixed icons', () => {
+  const bad = [];
+  for (const f of files(UI)) {
+    const rel = path.relative(UI, f).replaceAll('\\', '/'), code = fs.readFileSync(f, 'utf8');
+    for (const m of code.matchAll(/(?:innerHTML|outerHTML)\s*=\s*([^;\n]+)|insertAdjacentHTML|\bhtml\s*:/g)) {
+      if (m[1] && /^(?:''|""|ICON\[[a-z]+\])$/.test(m[1].trim())) continue;
+      if (rel === 'app.js' && /else if \(k === 'html'\) el\.innerHTML = v/.test(code.slice(m.index - 30, m.index + 30))) continue;
+      bad.push(`${rel}: ${m[0].slice(0, 60)}`);
+    }
+  }
+  assert.deepEqual(bad, []);
+});
+
 test('the live player gives the film page its own sandboxed frame and no window handle', () => {
   const live = fs.readFileSync(path.join(UI, 'review', 'live.js'), 'utf8');
   assert.match(live, /sandbox: 'allow-scripts allow-same-origin'/);
