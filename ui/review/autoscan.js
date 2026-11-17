@@ -21,10 +21,11 @@ export function createAutoScan({ src, projectId, frame, panelHost, onOpen, onClo
   const btn = h('button', { hidden: true, title: 'Check the film frame by frame: camera inside objects, embedded characters, flicker, black frames… (no render, no tokens)', onclick: () => shown ? hide() : show() }, '🔍 Scan');
   const panel = h('div', { class: 'ascan-panel' });
   let shown = false, running = false, stop = false, report = null, prog = null, added = new Set();
-  const win = () => { try { return src.win || null; } catch { return null; } };
+  const hasQa = () => !!src.page?.has?.qaFrame;
+  const editCall = (method, ...args) => src.ask('edit', { method, args, quiet: true }).then((r) => r?.value ?? null);
   const fps = () => src.info?.fps || 30, dur = () => src.duration || src.info?.dur || 0;
 
-  function check() { const w = win(); btn.hidden = !(w && typeof w.renderOut === 'function'); }
+  function check() { btn.hidden = !src.page; }
   async function show() {
     shown = true; btn.classList.add('on'); (panelHost || frame).append(panel); onOpen?.();
     if (!report) report = await api(`/api/project/${projectId}/autoscan`).catch(() => null);
@@ -35,9 +36,8 @@ export function createAutoScan({ src, projectId, frame, panelHost, onOpen, onClo
   // one frame: the engine's own QA numbers, or a 160x90 luma picture of the page
   const thumb = h('canvas', { width: 160, height: 90 }), tg = thumb.getContext('2d', { willReadFrequently: true });
   async function sample(t) {
-    const w = win();
-    if (typeof w.qaFrame === 'function') {
-      const r = w.qaFrame(t), [p, q] = r.lum.split('|'), s = atob(p) + atob(q), buf = new Uint8Array(N);
+    if (hasQa()) {
+      const r = await src.ask('qaFrame', { t }), [p, q] = String(r?.lum || '|').split('|'), s = atob(p) + atob(q), buf = new Uint8Array(N);
       for (let i = 0; i < N; i++) buf[i] = s.charCodeAt(i);
       delete r.lum; r.lumBuf = buf; return r;
     }
@@ -45,28 +45,32 @@ export function createAutoScan({ src, projectId, frame, panelHost, onOpen, onClo
     tg.drawImage(cv, 0, 0, 160, 90);
     const px = tg.getImageData(0, 0, 160, 90).data, buf = new Uint8Array(N); let sum = 0;
     for (let i = 0; i < N; i++) { buf[i] = Math.round(px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114); sum += buf[i]; }
-    return { t, mean: sum / N, lumBuf: buf, bones: [], inside: 0, near: -1, shot: w.__qaShot ? w.__qaShot() : '' };
+    const shot = await src.ask('qaShot').catch(() => '');
+    return { t, mean: sum / N, lumBuf: buf, bones: [], inside: 0, near: -1, shot: String(shot || '') };
   }
 
   // the range to scan: whole film, or the shot on screen (from cut to cut, VH_EDIT.findCut)
-  function shotRange() {
-    const E = win()?.VH_EDIT, t = src.currentTime;
-    if (E?.findCut) { const a = E.findCut(-1, t), b = E.findCut(1, t); return [a ? a.film : Math.max(0, t - 5), b ? b.film - 1 / fps() : Math.min(dur(), t + 5)]; }
+  async function shotRange() {
+    const t = src.currentTime;
+    let a = null, b = null, cuts = false;
+    if (src.page?.has?.edit) try { [a, b] = await Promise.all([editCall('findCut', -1, t), editCall('findCut', 1, t)]); cuts = true; } catch { }
+    if (cuts) { return [a ? a.film : Math.max(0, t - 5), b ? b.film - 1 / fps() : Math.min(dur(), t + 5)]; }
     return [Math.max(0, t - 5), Math.min(dur(), t + 5)];
   }
   async function run(mode) {
     if (running) return;
     const jobs = await api('/api/jobs').catch(() => []);
     if (jobs.some((j) => j.state === 'running')) toast('A render is running: scanning may be slow');
-    const F = fps(), [a, b] = mode === 'shot' ? shotRange() : [0, dur()], step = mode === 'quick' ? Math.max(1, Math.round(F / 4)) : 1;
+    const F = fps(), [a, b] = mode === 'shot' ? await shotRange() : [0, dur()], step = mode === 'quick' ? Math.max(1, Math.round(F / 4)) : 1;
     const frames = []; for (let f = Math.round(a * F); f <= Math.min(Math.round(b * F), Math.round(dur() * F) - 1); f += step) frames.push(f);
     if (!frames.length) return;
-    const keep = src.currentTime; src.pause(); win()?.VH_EDIT?.freeStop?.();
+    const keep = src.currentTime; src.pause(); if (src.page?.has?.edit) editCall('freeStop').catch(() => { });
     running = true; stop = false; prog = { done: 0, total: frames.length, t0: performance.now() }; paint();
     const res = [];
     try {
       // warm the state that carries from frame to frame (faces, marks), like a chunk render does
-      const w = win(); for (let f = Math.max(0, frames[0] - Math.round(2 * F)); f < frames[0]; f += 2) w.renderOut(f / F);
+      const warm = []; for (let f = Math.max(0, frames[0] - Math.round(2 * F)); f < frames[0]; f += 2) warm.push(f / F);
+      if (warm.length) await src.ask('warm', { times: warm }, 120000);
       for (let i = 0; i < frames.length && !stop; i++) {
         const r = await sample(frames[i] / F); if (r) { r.f = frames[i]; res.push(r); }
         prog.done = i + 1;
@@ -75,7 +79,7 @@ export function createAutoScan({ src, projectId, frame, panelHost, onOpen, onClo
     } catch (e) { toast('Scan stopped: ' + e.message, true); }
     running = false;
     const cut = stop; stop = false;
-    report = { at: new Date().toISOString(), mode, a, b: res.length ? res[res.length - 1].f / F : a, step, frames: res.length, partial: cut, qa: typeof win()?.qaFrame === 'function', ranges: analyze(res, step, F) };
+    report = { at: new Date().toISOString(), mode, a, b: res.length ? res[res.length - 1].f / F : a, step, frames: res.length, partial: cut, qa: hasQa(), ranges: analyze(res, step, F) };
     added = new Set();
     api(`/api/project/${projectId}/autoscan`, { method: 'PUT', body: report }).catch(() => { });
     src.currentTime = keep; paint();
@@ -150,7 +154,7 @@ export function createAutoScan({ src, projectId, frame, panelHost, onOpen, onClo
     panel.innerHTML = '';
     const head = h('div', { class: 'ascan-head' }, h('b', {}, '🔍 Auto scan'), h('span', { class: 'spacer' }), b('✕', 'Close', () => hide(), 'ghost'));
     if (running) { panel.append(head, h('div', { class: 'ascan-run dim' }, 'Scanning…'), bar, h('div', { class: 'ascan-row' }, b('■ Stop', 'Stop scanning here (keep results so far)', () => { stop = true; }, 'danger'))); paintProgress(); return; }
-    const qa = typeof win()?.qaFrame === 'function';
+    const qa = hasQa();
     panel.append(head,
       h('div', { class: 'dim ascan-hint' }, qa ? 'Camera, character, text depth and image checks (engine QA rules).' : 'Image checks: black/white frames, flicker, pops, freezing.', ' No render, no tokens.'),
       h('div', { class: 'ascan-row' },

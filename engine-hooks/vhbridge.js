@@ -39,6 +39,21 @@
     return out;
   }
 
+  // the scene editor (window.VH_EDIT, engine-hooks/vhtweaks.js): the calls VideoHub's editor makes
+  const EDIT = new Set(['set', 'nav', 'pivotAt', 'drag', 'pick', 'info', 'nudge', 'rotate', 'scale', 'hide', 'ground', 'resetObj',
+    'saveCam', 'resetCam', 'freeStart', 'freeStop', 'ovMove', 'ovScale', 'ovHide', 'ovReset', 'soundSet', 'findCut', 'cutShift', 'cutTr', 'cutReset']);
+  function editState(E) {
+    const q = f => { try { return f(); } catch { return null; } };
+    return {
+      shot: String(q(() => E.shot && E.shot()) || ''),
+      caps: clone(q(() => (E.caps ? E.caps() : { overlays: !!E.overlays, cuts: !!E.findCut }))) || {},
+      data: clone(q(() => E.get())) || { shots: {}, cuts: [], sound: [] },
+      free: clone(q(() => E.freeState && E.freeState())),
+      overlays: clone(q(() => (E.overlays ? E.overlays() : []))) || [],
+      has: Object.keys(E).filter(k => typeof E[k] === 'function'),
+    };
+  }
+
   const ops = {
     state: () => ({
       ready: window.READY === true && typeof window.renderOut === 'function',
@@ -46,6 +61,7 @@
       config: clone(window.__config || window.VH_CONFIG),
       data: +(window.DATA && window.DATA.width) && +window.DATA.height ? { width: +window.DATA.width, height: +window.DATA.height } : null,
       canvas: biggestCanvas(),
+      has: { edit: !!window.VH_EDIT, qaFrame: typeof window.qaFrame === 'function', vh2d: !!window.VH2D },
     }),
     render: ({ t }) => {
       const a = performance.now(), r = window.renderOut(+t), done = () => ({ t: +t, ms: performance.now() - a });
@@ -65,6 +81,20 @@
       return out;
     },
     qaShot: () => (typeof window.__qaShot === 'function' ? String(window.__qaShot()) : ''),
+    // the engine's own QA numbers for one moment (engine/qa.mjs)
+    qaFrame: ({ t }) => clone(window.qaFrame(+t)),
+    // draw several moments in order, for state that carries from frame to frame (faces, marks)
+    warm: ({ times }) => { for (const t of (Array.isArray(times) ? times : []).slice(0, 2000)) window.renderOut(+t); return null; },
+    // method null: only the editor's state; quiet: no state (camera drags send many calls per second)
+    edit: ({ method, args, quiet }) => {
+      const E = window.VH_EDIT; if (!E) throw new Error('This page has no scene editor.');
+      let value = null;
+      if (method != null) {
+        if (!EDIT.has(method) || typeof E[method] !== 'function') throw new Error('Unknown scene editor call: ' + method);
+        value = clone(E[method](...(Array.isArray(args) ? args : [])));
+      }
+      return { value, state: quiet ? null : editState(E) };
+    },
   };
 
   // a plain answer goes back in the same task, so a frame is drawn and reported before anything else runs

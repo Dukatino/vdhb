@@ -2,6 +2,7 @@
 // The user moves the camera, an object or a screen item right in the picture, or moves a cut; the change is saved to
 // the scene's tweaks.json at once and every later preview and render draws it. No code change, no Claude, no tokens.
 import { h, api, toast, confirmBox } from '../app.js';
+import { createEditProxy } from './editproxy.js';
 
 const STEPS = [0.01, 0.1, 1];
 const TC = (s) => { const m = Math.floor(s / 60), r = s - m * 60; return `${m}:${r.toFixed(2).padStart(5, '0')}`; };
@@ -12,7 +13,7 @@ const TC = (s) => { const m = Math.floor(s / 60), r = s - m * 60; return `${m}:$
 // applyNow(): the review page's sound build (one queue for every editor); onSoundSaved(r): its levels were saved
 export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, onClose, history, keysActive, applyNow, onSoundSaved }) {
   const btn = h('button', { hidden: true, title: 'Adjust the camera, objects, screen text or cuts directly in the picture; no code changes or tokens needed (tweaks.json)', onclick: () => open ? close() : start() }, '✏️ Edit scene');
-  let open = false, E = null, mode = 'cam', sel = null, scope = 'shot', step = 0.1, undo = [], saveTimer = 0, savedAt = 0;
+  let open = false, starting = false, E = null, openVersion = 0, mode = 'cam', sel = null, scope = 'shot', step = 0.1, undo = [], saveTimer = 0, savedAt = 0;
   let items = [], osel = null, cut = null;
   let snd = null, sndShot = null, sndApplied = null, sndBusy = false, sndBase = null;   // sound: what the film's mix allows, the shot on screen, the levels last put in        // screen items of this frame, the selected one; the cut being moved
   const cv = h('canvas', { class: 'sedit-cv' });
@@ -20,18 +21,22 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
   const panel = h('div', { class: 'sedit-panel' });
   const fps = () => src.info?.fps || 60;
   // what this page can do (older pages: overlays only when they report them)
-  const caps = () => { try { return E.caps ? E.caps() : { overlays: !!E.overlays, cuts: !!E.findCut }; } catch { return {}; } };
+  const caps = () => (E ? E.caps() : {});
 
-  const edit = () => { try { return src.win?.VH_EDIT || null; } catch { return null; } };
   const key = () => scope === 'all' ? '*' : (E.shot() || '*');
   // the page is ready (again): offer the button when it has the editor
   function check() {
-    const e = edit(); btn.hidden = !e;
-    if (open && e !== E) close(true);    // the page reloaded (code changed): its free camera and selection are gone
+    btn.hidden = !src.page?.has?.edit;
+    if (open && src.pageVersion !== openVersion) close(true);    // the page reloaded (code changed): its free camera and selection are gone
   }
 
-  function start() {
-    E = edit(); if (!E) return;
+  async function start() {
+    if (open || starting || !src.page?.has?.edit) return;
+    starting = true;
+    const e = createEditProxy(src), version = src.pageVersion;
+    try { await e.load(); } catch { return; } finally { starting = false; }
+    if (version !== src.pageVersion) return;
+    E = e; openVersion = version;
     open = true; btn.classList.add('on'); src.pause();
     frame.append(ov); (panelHost || frame).append(panel); undo = []; sel = null; osel = null; cut = null;
     if (!snd) api(`/api/project/${projectId}/sound-info`).then((r) => { snd = r; paint(); }).catch(() => { snd = { mode: 'none', channels: [] }; });
@@ -44,7 +49,7 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
   }
   function close(silent) {
     if (!open) return;
-    try { E?.freeStop(); } catch { }
+    E?.freeStop().catch(() => { });
     open = false; btn.classList.remove('on'); ov.remove(); panel.remove(); sel = null; osel = null;
     window.removeEventListener('keydown', onKey, true);
     flush(); onClose?.(); if (!silent) src.currentTime = src.currentTime;
@@ -57,18 +62,20 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
     else if (mode === 'ovl' && osel && e.key.startsWith('Arrow')) {     // arrows nudge the selected screen item
       e.preventDefault(); e.stopImmediatePropagation();
       const n = e.shiftKey ? 20 : 2, d = { ArrowLeft: [-n, 0], ArrowRight: [n, 0], ArrowUp: [0, -n], ArrowDown: [0, n] }[e.key];
-      change(() => E.ovMove(key(), osel, d[0], d[1])); refreshItems();
+      change(() => E.ovMove(key(), osel, d[0], d[1]));
     }
   }
 
-  // ---- changes: remember the state before for undo, save shortly after
-  function change(fn) {
+  // ---- changes: remember the state before for undo, save shortly after; resolves with fn's answer from the page
+  async function change(fn) {
+    await E.idle();
     undo.push(E.get()); if (undo.length > 80) undo.shift(); history?.push('scene');
-    const r = fn(); queueSave(); draw(); return r;
+    let r = null; try { r = await fn(); } catch (e) { toast('The film page did not apply the change: ' + e.message, true); }
+    queueSave(); if (mode === 'ovl') refreshItems(); draw(); return r;
   }
   function back(quiet) {
     const prev = undo.pop(); if (!prev) { if (!quiet) toast('Nothing to undo'); return false; }
-    E.set(prev); queueSave(); if (mode === 'ovl') refreshItems();
+    E.set(prev).then(() => { if (open && mode === 'ovl') { refreshItems(); draw(); paint(); } }, () => { }); queueSave();
     // the cut on show keeps its shift / transition from the restored snapshot (the panel label reads it)
     if (cut) {
       const c = (prev.cuts || []).find((x) => Math.abs(x.at - cut.at) < 1e-3);
@@ -82,6 +89,7 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
   // last sent), so levels, ducks and clips saved elsewhere survive — also when an undo here restores an old snapshot
   async function flush() {
     if (!saveTimer || !E) return; clearTimeout(saveTimer); saveTimer = 0;
+    await E.idle();
     const d = E.get(), cur = d.sound || [], ops = soundDiff(sndBase, cur);
     try {
       const r = await api(`/api/project/${projectId}/tweaks`, { method: 'PATCH', body: { shots: d.shots || {}, cuts: d.cuts || [], ...(ops ? { soundOps: ops } : {}) } });
@@ -104,14 +112,14 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
   }
   // a level saved elsewhere (timeline, Channels): into the page's copy, unless this editor has an unsent change there
   function syncSound(list) {
-    const e = E || edit(); if (!e || !e.soundSet) return;
+    const e = E; if (!open || !e || !e.has('soundSet')) return;
     const mine = e.get().sound || [], pend = new Set();
     for (const tf of touched) { const shot = tf.slice(0, tf.lastIndexOf('|')), f = tf.slice(tf.lastIndexOf('|') + 1); const a = (sndBase || []).find((x) => x.shot === shot), b = mine.find((x) => x.shot === shot); if ((a?.[f] ?? null) !== (b?.[f] ?? null)) pend.add(shot); }
     const shots = new Set([...(list || []).map((x) => x.shot), ...mine.map((x) => x.shot)]);
     for (const shot of shots) {
       if (pend.has(shot)) continue;
       const n = (list || []).find((x) => x.shot === shot), o = mine.find((x) => x.shot === shot);
-      try { e.soundSet(n ? { ...n } : { shot, t0: o.t0, t1: o.t1 }); } catch { }
+      e.soundSet(n ? { ...n } : { shot, t0: o.t0, t1: o.t1 }).catch(() => { });
     }
     sndBase = (list || []).map((x) => ({ ...x }));
     if (open) paint();
@@ -128,7 +136,7 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
     ov.setPointerCapture(e.pointerId);
     const p = ndc(e);
     drag = { p0: p, last: p, moved: false, btn: e.button, shift: e.shiftKey, alt: e.altKey, snap: E.get() };
-    if (mode === 'cam' && e.button === 0 && !e.shiftKey && !e.altKey) E.pivotAt(p[0], p[1]);
+    if (mode === 'cam' && e.button === 0 && !e.shiftKey && !e.altKey) E.pivotAt(p[0], p[1]).catch(() => { });
     // a press on a screen item selects it at once, so one drag both picks and moves it
     if (mode === 'ovl') { const hit = itemAt(toPx(p)); if (hit && hit.id !== osel) { osel = hit.id; draw(); paint(); } }
   });
@@ -137,9 +145,9 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
     const p = ndc(e), dx = p[0] - drag.last[0], dy = p[1] - drag.last[1];
     if (!drag.moved && Math.hypot(p[0] - drag.p0[0], p[1] - drag.p0[1]) < 0.01) return;
     drag.moved = true;
-    if (mode === 'cam') E.nav(drag.btn === 2 || drag.shift ? 'pan' : drag.alt ? 'look' : 'orbit', dx / 2, dy / 2);
-    else if (mode === 'obj' && sel) { E.drag(key(), sel.path, drag.last[0], drag.last[1], p[0], p[1], drag.shift); draw(); }
-    else if (mode === 'ovl' && osel) { E.ovMove(key(), osel, drag.shift ? 0 : dx / 2 * 1920, -dy / 2 * 1080); refreshItems(); draw(); }
+    if (mode === 'cam') E.nav(drag.btn === 2 || drag.shift ? 'pan' : drag.alt ? 'look' : 'orbit', dx / 2, dy / 2).catch(() => { });
+    else if (mode === 'obj' && sel) E.drag(key(), sel.path, drag.last[0], drag.last[1], p[0], p[1], drag.shift).then(() => draw(), () => { });
+    else if (mode === 'ovl' && osel) E.ovMove(key(), osel, drag.shift ? 0 : dx / 2 * 1920, -dy / 2 * 1080).then(() => { refreshItems(); draw(); }, () => { });
     drag.last = p;
   });
   ov.addEventListener('pointerup', () => {
@@ -151,13 +159,14 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
   });
   ov.addEventListener('wheel', (e) => {
     e.preventDefault(); e.stopPropagation();
-    if (mode === 'cam') E.nav('dolly', e.deltaY * 0.0012);
+    if (mode === 'cam') E.nav('dolly', e.deltaY * 0.0012).catch(() => { });
     else if (mode === 'obj' && sel) change(() => E.nudge(key(), sel.path, [0, (e.deltaY < 0 ? 1 : -1) * step, 0]));
     else if (mode === 'ovl' && osel) scaleItem(e.deltaY < 0 ? 1.05 : 1 / 1.05);
   }, { passive: false });
 
-  function pickAt(p) {
-    const r = E.pick(p[0], p[1]);
+  async function pickAt(p) {
+    let r = null; try { r = await E.pick(p[0], p[1]); } catch { }
+    if (!open || mode !== 'obj') return;
     if (!r) { sel = null; draw(); paint(); return; }
     sel = { chain: r.chain, i: r.sel, ...r.chain[r.sel] };
     draw(); paint();
@@ -168,20 +177,23 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
     sel = { chain: sel.chain, i, ...sel.chain[i] }; draw(); paint();
   }
   // screen items: the smallest box under the point
-  function refreshItems() { try { items = E.overlays(); } catch { items = []; } }
+  function refreshItems() { items = E ? E.overlays() : []; }
+  // the screen items of the moment on screen (they change with every frame)
+  const loadItems = () => E.load().then(() => { refreshItems(); if (osel && !items.some((i) => i.id === osel)) osel = null; }, () => { items = []; });
   function itemAt([x, y]) {
     return items.filter((it) => x >= it.box[0] - 6 && x <= it.box[2] + 6 && y >= it.box[1] - 6 && y <= it.box[3] + 6)
       .sort((a, b) => (a.box[2] - a.box[0]) * (a.box[3] - a.box[1]) - (b.box[2] - b.box[0]) * (b.box[3] - b.box[1]))[0] || null;
   }
   function scaleItem(k) {
     const it = items.find((i) => i.id === osel); if (!it) return;
-    change(() => E.ovScale(key(), osel, k, (it.box[0] + it.box[2]) / 2, (it.box[1] + it.box[3]) / 2)); refreshItems(); draw();
+    change(() => E.ovScale(key(), osel, k, (it.box[0] + it.box[2]) / 2, (it.box[1] + it.box[3]) / 2));
   }
   const itemName = (it) => it.text ? `“${it.text}”` : it.kind === 'custom' ? `drawing ${+it.id.split('#').pop() + 1}` : `${it.kind} ${+it.id.split('#').pop() + 1}`;
 
   // boxes on the picture: the selected object, or the screen items
-  function draw() {
-    const r = ov.getBoundingClientRect();
+  let drawSeq = 0;
+  async function draw() {
+    const mine = ++drawSeq, r = ov.getBoundingClientRect();
     cv.width = Math.round(r.width); cv.height = Math.round(r.height);
     const g = cv.getContext('2d'); g.clearRect(0, 0, cv.width, cv.height);
     if (mode === 'ovl') {
@@ -194,23 +206,26 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
       return;
     }
     if (!sel || mode !== 'obj') return;
-    const info = E.info(sel.path); if (!info?.rect) return;
-    sel.size = info.size;
+    let info = null; try { info = await E.info(sel.path); } catch { }
+    if (mine !== drawSeq || !sel || mode !== 'obj' || !Array.isArray(info?.rect)) return;
+    sel.size = Array.isArray(info.size) ? info.size : null;
     const [x0, y0, x1, y1] = info.rect, X = (x) => (x + 1) / 2 * cv.width, Y = (y) => (1 - y) / 2 * cv.height;
     g.strokeStyle = '#ffb547'; g.lineWidth = 2; g.setLineDash([6, 4]);
     g.strokeRect(X(x0), Y(y1), X(x1) - X(x0), Y(y0) - Y(y1));
   }
 
   // ---- cuts: find the next / previous one, show its first frame, move it by frames
-  function goCut(dir) {
+  async function goCut(dir) {
     const from = cut ? cut.film + dir / fps() : undefined;
-    const r = E.findCut(dir, from, fps());
+    let r = null; try { r = await E.findCut(dir, from, fps()); } catch { }
     if (!r) return toast(dir > 0 ? 'No cut in the next 40 seconds' : 'No cut in the previous 40 seconds');
     cut = r; src.currentTime = r.film + 0.5 / fps(); paint();
   }
-  function moveCut(frames) {
+  async function moveCut(frames) {
     if (!cut) return;
-    change(() => { cut.d = E.cutShift(cut.at, frames, fps()); cut.film = +(cut.at + cut.d).toFixed(4); });
+    const c = cut;
+    await change(async () => { c.d = +(await E.cutShift(c.at, frames, fps())) || 0; c.film = +(c.at + c.d).toFixed(4); });
+    if (cut !== c) return;
     src.currentTime = cut.film + 0.5 / fps(); paint();
   }
   function playCut() {
@@ -242,7 +257,7 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
     if (!cut?.tr) return;
     const tr = { ...cut.tr }, F = fps(); let n = 0, from = 0;
     if (!await confirmBox('Apply transition to all cuts', h('p', {}, `Apply "${trDef(tr.type).label || tr.type}" to every cut in the film?`), 'Apply')) return;
-    change(() => { for (let i = 0; i < 2000; i++) { const r = E.findCut(1, from, F); if (!r) break; E.cutTr(r.at, tr); n++; from = r.film + 1 / F; } });
+    await change(async () => { for (let i = 0; i < 2000; i++) { const r = await E.findCut(1, from, F); if (!r) break; await E.cutTr(r.at, tr); n++; from = r.film + 1 / F; } });
     toast(`Applied to ${n} cuts`); paint();
   }
   function trPanel() {
@@ -268,24 +283,25 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
   // ---- panel
   function setMode(m) {
     mode = m;
-    try { m === 'cam' ? E.freeStart() : E.freeStop(); } catch { }
+    (m === 'cam' ? E.freeStart() : E.freeStop()).catch(() => { });
     ov.style.cursor = m === 'cam' ? 'grab' : m === 'cut' ? 'default' : m === 'ovl' ? 'move' : 'crosshair';
     ov.classList.toggle('passive', m === 'cut');
-    if (m === 'ovl') refreshItems();
-    if (m === 'snd') findSndShot();
+    if (m === 'ovl') loadItems().then(() => { if (open && mode === 'ovl') { draw(); paint(); } });
+    if (m === 'snd') findSndShot().then(() => { if (open && mode === 'snd') paint(); });
     draw(); paint();
   }
   // the shot on screen as film time (cut to cut); the whole film for the "Whole film" scope
-  function findSndShot() {
-    const t = src.currentTime, F = fps(), a = E.findCut(-1, t + 0.5 / F, F), z = E.findCut(1, t, F);
+  async function findSndShot() {
+    const t = src.currentTime, F = fps();
+    let a = null, z = null; try { [a, z] = await Promise.all([E.findCut(-1, t + 0.5 / F, F), E.findCut(1, t, F)]); } catch { }
     sndShot = { shot: E.shot() || '*', t0: a ? a.film : 0, t1: z ? z.film : (src.duration || 0) };
   }
   const sndEntry = () => { const k = scope === 'all' ? '*' : sndShot?.shot; return (E.get().sound || []).find((e) => e.shot === k) || null; };
-  function setLevel(ch, v) {
-    if (!sndShot) findSndShot();
+  async function setLevel(ch, v) {
+    if (!sndShot) await findSndShot();
     const all = scope === 'all', base = sndEntry() || {};
     touched.add(`${all ? '*' : sndShot.shot}|${ch}`);
-    change(() => E.soundSet({ ...base, shot: all ? '*' : sndShot.shot, t0: all ? 0 : sndShot.t0, t1: all ? (src.duration || 1e6) : sndShot.t1, [ch]: v }));
+    await change(() => E.soundSet({ ...base, shot: all ? '*' : sndShot.shot, t0: all ? 0 : sndShot.t0, t1: all ? (src.duration || 1e6) : sndShot.t1, [ch]: v }));
     paint();
   }
   async function applySound() {
@@ -314,11 +330,11 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
     if (mode === 'cam') {
       const fs = E.freeState();
       body.push(h('div', { class: 'sedit-hint' }, 'Drag: orbit · Shift or right-click: pan · Alt: look around · Wheel: zoom in/out'),
-        h('label', { class: 'sedit-row' }, 'Lens (FOV) ', h('input', { type: 'range', min: 12, max: 100, step: 0.5, value: fs?.fov || 50, oninput: (e) => { E.nav('fov', +e.target.value); e.target.nextSibling.textContent = ' ' + (+e.target.value).toFixed(0) + '°'; } }), h('span', {}, ' ' + Math.round(fs?.fov || 50) + '°')),
+        h('label', { class: 'sedit-row' }, 'Lens (FOV) ', h('input', { type: 'range', min: 12, max: 100, step: 0.5, value: fs?.fov || 50, oninput: (e) => { E.nav('fov', +e.target.value).catch(() => { }); e.target.nextSibling.textContent = ' ' + (+e.target.value).toFixed(0) + '°'; } }), h('span', {}, ' ' + Math.round(fs?.fov || 50) + '°')),
         h('div', { class: 'sedit-row' },
-          b('✓ Save angle', 'Use this angle as the scene camera (the scene\'s own motion is preserved and added to it)', () => { change(() => E.saveCam(key())); toast('Camera angle saved'); setMode('cam'); }, 'primary'),
-          b('Reset view', 'Reset the free camera to the scene camera', () => { E.freeStop(); E.freeStart(); }),
-          here.camera ? b('↺ Clear camera adjustment', 'Remove the camera adjustment for this scene', () => { change(() => E.resetCam(key())); setMode('cam'); }, 'danger') : null));
+          b('✓ Save angle', 'Use this angle as the scene camera (the scene\'s own motion is preserved and added to it)', () => change(() => E.saveCam(key())).then(() => { toast('Camera angle saved'); setMode('cam'); }), 'primary'),
+          b('Reset view', 'Reset the free camera to the scene camera', () => { E.freeStop().catch(() => { }); E.freeStart().catch(() => { }); }),
+          here.camera ? b('↺ Clear camera adjustment', 'Remove the camera adjustment for this scene', () => change(() => E.resetCam(key())).then(() => setMode('cam')), 'danger') : null));
     } else if (mode === 'obj') {
       body.push(h('div', { class: 'sedit-hint' }, 'Click: select · Drag: move · Shift+drag: vertical only · Wheel: move up/down · Esc: clear selection'));
       if (!sel) body.push(h('div', { class: 'dim' }, 'Click an object.'));
@@ -330,7 +346,7 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
           h('div', { class: 'sedit-row' },
             b('↑', `${step} m up`, () => change(() => E.nudge(key(), sel.path, [0, step, 0]))),
             b('↓', `${step} m down`, () => change(() => E.nudge(key(), sel.path, [0, -step, 0]))),
-            b('Place on surface', 'Move onto a nearby surface below it (or lift it out if slightly embedded)', () => { const d = change(() => E.ground(key(), sel.path)); toast(d == null ? 'No nearby surface below it' : `Placed on surface (${d > 0 ? '+' : ''}${d} m)`); }),
+            b('Place on surface', 'Move onto a nearby surface below it (or lift it out if slightly embedded)', () => change(() => E.ground(key(), sel.path)).then((d) => toast(d == null ? 'No nearby surface below it' : `Placed on surface (${d > 0 ? '+' : ''}${d} m)`))),
             stepSel),
           h('div', { class: 'sedit-row' },
             b('⟲ 15°', 'Rotate left', () => change(() => E.rotate(key(), sel.path, 15))), b('⟳ 15°', 'Rotate right', () => change(() => E.rotate(key(), sel.path, -15))),
@@ -347,8 +363,8 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
         const t = (here.overlays || {})[it.id] || {};
         body.push(h('div', { class: 'sedit-row' },
             b('＋10%', 'Enlarge', () => scaleItem(1.1)), b('－10%', 'Shrink', () => scaleItem(1 / 1.1)),
-            b(t.hide ? 'Show' : 'Hide', 'Hide in this scene', () => { change(() => E.ovHide(key(), it.id, !t.hide)); refreshItems(); paint(); }),
-            Object.keys(t).length ? b('↺ Reset', 'Remove this item\'s adjustments', () => { change(() => E.ovReset(key(), it.id)); refreshItems(); draw(); paint(); }, 'danger') : null),
+            b(t.hide ? 'Show' : 'Hide', 'Hide in this scene', () => change(() => E.ovHide(key(), it.id, !t.hide)).then(paint)),
+            Object.keys(t).length ? b('↺ Reset', 'Remove this item\'s adjustments', () => change(() => E.ovReset(key(), it.id)).then(paint), 'danger') : null),
           Object.keys(t).length ? h('div', { class: 'dim' }, 'Adjustment: ' + [t.dx || t.dy ? `moved (${t.dx || 0}, ${t.dy || 0}) px` : '', t.s ? `×${t.s.toFixed(2)}` : '', t.hide ? 'hidden' : ''].filter(Boolean).join(' · ')) : null);
       }
     } else if (mode === 'snd') {
@@ -365,7 +381,7 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
           }
           body.push(h('div', { class: 'sedit-row' },
             b(sndBusy ? 'Building…' : '🔊 Apply and listen', 'Apply levels to the film audio (the original is backed up) and play this scene with sound', () => applySound(), 'primary'),
-            Object.keys(e).some((k) => ['music', 'sfx', 'vo', 'all'].includes(k)) ? b('↺ Clear this adjustment', 'Remove the audio adjustment for this scene', () => { for (const k of ['music', 'sfx', 'vo', 'all']) touched.add(`${e.shot}|${k}`); change(() => E.soundSet({ shot: e.shot, t0: e.t0, t1: e.t1 })); paint(); }, 'danger') : null),
+            Object.keys(e).some((k) => ['music', 'sfx', 'vo', 'all'].includes(k)) ? b('↺ Clear this adjustment', 'Remove the audio adjustment for this scene', () => { for (const k of ['music', 'sfx', 'vo', 'all']) touched.add(`${e.shot}|${k}`); change(() => E.soundSet({ shot: e.shot, t0: e.t0, t1: e.t1 })).then(paint); }, 'danger') : null),
             dirty ? h('div', { class: 'sedit-warn' }, 'Changes have not been applied to the audio yet: click "Apply and listen".') : null,
             h('div', { class: 'dim' }, `Scenes with audio adjustments: ${(E.get().sound || []).length}`));
         }
@@ -389,7 +405,7 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
       h('div', { class: 'sedit-head' }, h('b', {}, 'Edit scene'), mode === 'cut' ? h('span', { class: 'dim' }, 'whole film') : scopeSel, h('span', { class: 'spacer' }), b('✕', 'Close (Esc)', () => close(), 'ghost')),
       h('div', { class: 'segs sedit-seg' },
         [['cam', '🎥 Camera', 'Camera angle'], ['obj', '📦 Object', 'Move / rotate / hide an object'], ['ovl', '🔤 Screen', 'Screen text and drawings: move / enlarge / hide'], ['cut', '✂️ Cut', 'Move a scene cut or choose a transition type'], ['snd', '🔊 Sound', 'Music / effects / voice levels per scene']]
-          .filter(([m]) => (m !== 'ovl' || caps().overlays) && (m !== 'snd' || (caps().sound && E.soundSet))).map(([m, l, t]) => b(l, t, () => setMode(m), 'seg' + (mode === m ? ' on' : '')))),
+          .filter(([m]) => (m !== 'ovl' || caps().overlays) && (m !== 'snd' || (caps().sound && E.has('soundSet')))).map(([m, l, t]) => b(l, t, () => setMode(m), 'seg' + (mode === m ? ' on' : '')))),
       ...body.filter(Boolean),
       h('div', { class: 'sedit-foot dim' },
         `In this scope: ${here.camera ? 'camera ✓ · ' : ''}${nObj} objects · ${nOv} screen items · ${nAll} scenes adjusted · ${nCut} cuts`,
@@ -399,11 +415,12 @@ export function createSceneEditor({ src, projectId, frame, panelHost, onOpen, on
   const describeTweak = (t) => [t.dp && `moved (${t.dp.map((n) => n.toFixed(2)).join(', ')})`, t.ry && `${t.ry}°`, t.s && `×${t.s.toFixed(2)}`, t.hide && 'hidden'].filter(Boolean).join(' · ');
 
   // another moment: the free camera starts again from that shot's own camera, boxes follow
-  function onSeek() {
+  async function onSeek() {
     if (!open || drag) return;
-    if (mode === 'cam') { E.freeStop(); E.freeStart(); }
-    if (mode === 'ovl') { refreshItems(); if (osel && !items.some((i) => i.id === osel)) osel = null; }
-    if (mode === 'snd') findSndShot();
+    if (mode === 'cam') { E.freeStop().catch(() => { }); E.freeStart().catch(() => { }); }
+    if (mode === 'snd') await findSndShot();
+    await loadItems();
+    if (!open) return;
     draw(); paint();
   }
   src.addEventListener('loadedmetadata', check);

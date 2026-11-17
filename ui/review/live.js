@@ -18,6 +18,7 @@ export function createLiveSource(info, { onStatus } = {}) {
   let wantPlay = false;   // play asked for while the page was loading: start once it is ready
   let base = { t: 0, at: 0 }, raf = 0, need = false, rvfc = [], frames = 0, fpsAt = performance.now(), drawMs = 0, scale = 1;
   let drawing = false, drawingAt = null, drawAgain = false;   // one renderOut in flight: slow frames are skipped
+  let page = null;   // what the ready page offers: { has: { edit, qaFrame, vh2d } }
   const audio = info.audio ? h('audio', { src: info.audio, preload: 'auto' }) : null;
   const src = new EventTarget();
   const fire = type => src.dispatchEvent(new Event(type));
@@ -66,7 +67,7 @@ export function createLiveSource(info, { onStatus } = {}) {
     const version = ++loadVersion;
     dropCalls(); drawing = false; drawingAt = null; drawAgain = false;
     clearTimeout(playTimer); playTimer = 0; rvfc = [];
-    ready = false; status({ state: 'loading' });
+    ready = false; page = null; status({ state: 'loading' });
     const q = `vhparent=${encodeURIComponent(location.origin)}&vh=${Date.now()}`;
     const f = h('iframe', { class: 'live', src: `${info.url}${info.url.includes('?') ? '&' : '?'}${q}`, scrolling: 'no', tabindex: '-1' });
     f.style.width = info.w + 'px'; f.style.height = info.h + 'px'; f.style.transform = `scale(${scale})`;
@@ -85,7 +86,7 @@ export function createLiveSource(info, { onStatus } = {}) {
         if (err || !s || destroyed || version !== loadVersion || waitTimer !== wait) return;
         if (s.error) { clearInterval(wait); status({ state: 'error', error: s.error }); return; }
         if (!s.ready) return;
-        clearInterval(wait); ready = true; status({ state: 'ready', ms: Math.round(performance.now() - t0) });
+        clearInterval(wait); ready = true; page = { has: { ...(s.has || {}) } }; status({ state: 'ready', ms: Math.round(performance.now() - t0) });
         if (wantPlay) playTimer = setTimeout(() => { playTimer = 0; if (!destroyed && version === loadVersion && wantPlay) play(); }, 50);
         // the page may know its own timing and size better (the 3D studio sets window.__config); else its DATA
         // size, else its biggest canvas when its shape differs (a 9:16 film must not show only its top square)
@@ -215,7 +216,9 @@ export function createLiveSource(info, { onStatus } = {}) {
       fire('seeking');
     } },
     paused: { get: () => paused && !wantPlay },
-    win: { get: () => iframe?.contentWindow || null },   // the page itself (scene editor: window.VH_EDIT)
+    win: { get: () => iframe?.contentWindow || null },   // the page itself (2D layers: window.VH2D)
+    page: { get: () => page },
+    pageVersion: { get: () => loadVersion },
     seeking: { get: () => seeking },
     ended: { get: () => t >= info.dur - 1e-3 },
     duration: { get: () => info.dur },
